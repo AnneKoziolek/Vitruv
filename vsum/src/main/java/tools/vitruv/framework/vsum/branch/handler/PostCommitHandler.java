@@ -6,9 +6,13 @@ import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
+import tools.vitruv.change.atomic.EChange;
+import tools.vitruv.change.atomic.hid.HierarchicalId;
 import tools.vitruv.framework.vsum.branch.data.FileChange;
 import tools.vitruv.framework.vsum.branch.data.SemanticChangelog;
+import tools.vitruv.framework.vsum.branch.merge.SemanticChangeLog;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -56,6 +60,33 @@ public class PostCommitHandler {
      * @param branch    the branch on which the commit was made. Must not be null.
      * @return a {@link SemanticChangelog} with an empty change list and a placeholder author.
      */
+    /**
+     * Generates a semantic changelog AND persists the semantic change log (EChange-level)
+     * if primary changes are provided.
+     *
+     * @param commitSha      the real Git commit SHA.
+     * @param branch         the branch on which the commit was made.
+     * @param primaryChanges the primary EChanges captured during this commit's propagation.
+     * @return a {@link SemanticChangelog} with Git metadata.
+     */
+    public SemanticChangelog generateChangelog(String commitSha, String branch,
+                                               List<EChange<HierarchicalId>> primaryChanges) {
+        // Persist the EChange-level semantic change log
+        if (primaryChanges != null && !primaryChanges.isEmpty()) {
+            try {
+                SemanticChangeLog changeLog = new SemanticChangeLog(commitSha, branch, primaryChanges);
+                changeLog.saveTo(repositoryRoot);
+                LOGGER.info("Persisted semantic change log with {} EChanges for commit {}",
+                        primaryChanges.size(), commitSha.substring(0, Math.min(7, commitSha.length())));
+            } catch (IOException e) {
+                LOGGER.warn("Failed to persist semantic change log for commit {}", commitSha, e);
+            }
+        }
+
+        // Generate the existing metadata changelog
+        return generateChangelog(commitSha, branch);
+    }
+
     public SemanticChangelog generateChangelog(String commitSha, String branch) {
         checkNotNull(commitSha, "commit SHA must not be null");
         checkNotNull(branch, "branch must not be null");

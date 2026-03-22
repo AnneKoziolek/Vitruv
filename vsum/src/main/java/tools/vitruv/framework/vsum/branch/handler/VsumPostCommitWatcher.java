@@ -1,10 +1,15 @@
 package tools.vitruv.framework.vsum.branch.handler;
 
+import java.util.List;
+
 import lombok.Getter;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.eclipse.jgit.api.Git;
+import tools.vitruv.change.atomic.EChange;
+import tools.vitruv.change.atomic.hid.HierarchicalId;
 import tools.vitruv.framework.vsum.branch.data.SemanticChangelog;
+import tools.vitruv.framework.vsum.branch.merge.ChangeLogCapture;
 import tools.vitruv.framework.vsum.branch.util.PostCommitTriggerFile;
 
 import java.nio.file.Path;
@@ -41,6 +46,7 @@ public class VsumPostCommitWatcher {
     private final Path repositoryRoot;
     private final PostCommitTriggerFile triggerFile;
     private final PostCommitHandler handler;
+    private final ChangeLogCapture changeLogCapture;
 
     private Thread watcherThread;
 
@@ -56,9 +62,20 @@ public class VsumPostCommitWatcher {
      * @param repositoryRoot the root directory of the Git repository. Must not be null.
      */
     public VsumPostCommitWatcher(Path repositoryRoot) {
+        this(repositoryRoot, null);
+    }
+
+    /**
+     * Creates a post-commit watcher with optional semantic change log capture.
+     *
+     * @param repositoryRoot  the root directory of the Git repository. Must not be null.
+     * @param changeLogCapture optional capture listener to drain EChanges from. May be null.
+     */
+    public VsumPostCommitWatcher(Path repositoryRoot, ChangeLogCapture changeLogCapture) {
         this.repositoryRoot = checkNotNull(repositoryRoot, "repository root must not be null");
         this.triggerFile = new PostCommitTriggerFile(repositoryRoot);
         this.handler = new PostCommitHandler(repositoryRoot);
+        this.changeLogCapture = changeLogCapture;
         this.running = false;
     }
 
@@ -140,7 +157,16 @@ public class VsumPostCommitWatcher {
 
         LOGGER.info("Post-commit changelog generation triggered for commit {} on branch {}", commitShort, info.getBranch());
         try {
-            SemanticChangelog changelog = handler.generateChangelog(info.getCommitSha(), info.getBranch());
+            // Drain captured primary changes if available
+            List<EChange<HierarchicalId>> primaryChanges = null;
+            if (changeLogCapture != null) {
+                primaryChanges = changeLogCapture.drainChanges();
+                LOGGER.debug("Drained {} primary changes from capture for commit {}", primaryChanges.size(), commitShort);
+            }
+
+            SemanticChangelog changelog = (primaryChanges != null && !primaryChanges.isEmpty())
+                    ? handler.generateChangelog(info.getCommitSha(), info.getBranch(), primaryChanges)
+                    : handler.generateChangelog(info.getCommitSha(), info.getBranch());
 
             Path changelogFile = repositoryRoot.resolve(".vitruvius").resolve("changelogs").resolve(commitShort + ".txt");
 
