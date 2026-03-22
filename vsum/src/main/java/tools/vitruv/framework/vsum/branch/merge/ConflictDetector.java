@@ -11,39 +11,55 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import tools.vitruv.change.atomic.EChange;
+import tools.vitruv.change.atomic.eobject.CreateEObject;
 import tools.vitruv.change.atomic.eobject.DeleteEObject;
 import tools.vitruv.change.atomic.eobject.EObjectExistenceEChange;
 import tools.vitruv.change.atomic.feature.FeatureEChange;
+import tools.vitruv.change.atomic.feature.attribute.InsertEAttributeValue;
+import tools.vitruv.change.atomic.feature.attribute.ReplaceSingleValuedEAttribute;
+import tools.vitruv.change.atomic.feature.reference.InsertEReference;
+import tools.vitruv.change.atomic.feature.reference.ReplaceSingleValuedEReference;
 import tools.vitruv.change.atomic.hid.HierarchicalId;
+import tools.vitruv.change.atomic.feature.reference.RemoveEReference;
+import tools.vitruv.change.atomic.root.InsertRootEObject;
+import tools.vitruv.change.atomic.root.RemoveRootEObject;
 import tools.vitruv.change.atomic.root.RootEChange;
 
 /**
  * Detects semantic conflicts between two sets of EChanges from divergent branches.
  *
- * <p>For the prototype, conflict detection is element-level:
- * if both branches modify the same element (identified by HierarchicalId),
- * a conflict is reported. Special handling for delete-vs-modify.
+ * <p>Non-conflicting operations (both branches can safely do them):
+ * <ul>
+ *   <li>Both branches insert into the same multi-valued feature (list)</li>
+ *   <li>Both branches create new objects</li>
+ *   <li>Both branches insert root objects</li>
+ * </ul>
+ *
+ * <p>True conflicts:
+ * <ul>
+ *   <li>Both branches replace the same single-valued feature with different values</li>
+ *   <li>One branch deletes an element the other modifies</li>
+ * </ul>
  */
 public class ConflictDetector {
 
     private static final Logger LOGGER = LogManager.getLogger(ConflictDetector.class);
 
-    /**
-     * Detects conflicts between changes from the target ("ours") and source ("theirs") branches.
-     *
-     * @param oursChanges   changes from the target branch since merge base
-     * @param theirsChanges changes from the source branch since merge base
-     * @return list of detected conflicts (empty if no conflicts)
-     */
     public List<MergeConflict> detectConflicts(
             List<EChange<HierarchicalId>> oursChanges,
             List<EChange<HierarchicalId>> theirsChanges) {
 
-        // Group changes by affected element ID
-        Map<String, List<EChange<HierarchicalId>>> oursByElement = groupByElement(oursChanges);
-        Map<String, List<EChange<HierarchicalId>>> theirsByElement = groupByElement(theirsChanges);
+        // Collect element IDs of newly created objects — changes to these are initialization, not conflicts
+        Set<String> oursCreatedElements = collectCreatedElementIds(oursChanges);
+        Set<String> theirsCreatedElements = collectCreatedElementIds(theirsChanges);
 
-        // Find overlapping elements
+        // Only consider potentially conflicting changes (not inserts or creates)
+        List<EChange<HierarchicalId>> oursConflictable = filterConflictableChanges(oursChanges, oursCreatedElements);
+        List<EChange<HierarchicalId>> theirsConflictable = filterConflictableChanges(theirsChanges, theirsCreatedElements);
+
+        Map<String, List<EChange<HierarchicalId>>> oursByElement = groupByElement(oursConflictable);
+        Map<String, List<EChange<HierarchicalId>>> theirsByElement = groupByElement(theirsConflictable);
+
         Set<String> overlapping = new HashSet<>(oursByElement.keySet());
         overlapping.retainAll(theirsByElement.keySet());
 
@@ -59,15 +75,62 @@ public class ConflictDetector {
         if (!conflicts.isEmpty()) {
             LOGGER.info("Detected {} semantic conflicts", conflicts.size());
         } else {
-            LOGGER.debug("No semantic conflicts detected");
+            LOGGER.debug("No semantic conflicts detected (overlapping additive changes are safe)");
         }
 
         return conflicts;
     }
 
     /**
-     * Groups EChanges by the HierarchicalId of the affected element.
+     * Filters out additive changes that can never conflict:
+     * - InsertEReference (adding to a multi-valued reference list)
+     * - InsertEAttributeValue (adding to a multi-valued attribute list)
+     * - InsertRootEObject (adding a root to a resource)
+     * - CreateEObject (creating new objects)
+     *
+     * These are safe because both branches can independently add to the same list.
      */
+    /**
+     * Collects element IDs of objects that were created in this change set.
+     * Changes to newly created objects are initialization, not conflicts.
+     */
+    private Set<String> collectCreatedElementIds(List<EChange<HierarchicalId>> changes) {
+        Set<String> created = new HashSet<>();
+        for (EChange<HierarchicalId> change : changes) {
+            if (change instanceof CreateEObject<HierarchicalId> createChange) {
+                HierarchicalId id = createChange.getAffectedElement();
+                if (id != null) created.add(id.toString());
+            }
+        }
+        return created;
+    }
+
+    /**
+     * Filters to only potentially conflicting changes:
+     * - Single-valued replacements on pre-existing elements
+     * - Deletions
+     * - Removals from references
+     *
+     * Excludes changes to elements that were just created (initialization, not conflict).
+     */
+    private List<EChange<HierarchicalId>> filterConflictableChanges(
+            List<EChange<HierarchicalId>> changes, Set<String> createdElementIds) {
+        return changes.stream()
+                .filter(c -> c instanceof ReplaceSingleValuedEAttribute<?, ?>
+                        || c instanceof ReplaceSingleValuedEReference<?>
+                        || c instanceof DeleteEObject<?>
+                        || c instanceof RemoveEReference<?>)
+                .filter(c -> {
+                    // Exclude changes to newly created objects
+                    if (c instanceof FeatureEChange<HierarchicalId, ?> fc) {
+                        HierarchicalId id = fc.getAffectedElement();
+                        return id == null || !createdElementIds.contains(id.toString());
+                    }
+                    return true;
+                })
+                .toList();
+    }
+
     private Map<String, List<EChange<HierarchicalId>>> groupByElement(
             List<EChange<HierarchicalId>> changes) {
         Map<String, List<EChange<HierarchicalId>>> result = new HashMap<>();
@@ -80,26 +143,23 @@ public class ConflictDetector {
         return result;
     }
 
-    /**
-     * Extracts the primary affected element identifier from an EChange.
-     */
     private String extractElementId(EChange<HierarchicalId> change) {
         if (change instanceof FeatureEChange<HierarchicalId, ?> featureChange) {
             HierarchicalId id = featureChange.getAffectedElement();
-            return id != null ? id.toString() : null;
+            // Use element + feature as conflict key so that changes to different
+            // features of the same element don't conflict
+            String featureName = featureChange.getAffectedFeature() != null
+                    ? featureChange.getAffectedFeature().getName() : "";
+            return id != null ? id.toString() + "#" + featureName : null;
         } else if (change instanceof EObjectExistenceEChange<HierarchicalId> existenceChange) {
             HierarchicalId id = existenceChange.getAffectedElement();
             return id != null ? id.toString() : null;
         } else if (change instanceof RootEChange<HierarchicalId> rootChange) {
-            // For root changes, use the resource URI + index as identifier
             return rootChange.getUri() + "#" + rootChange.getIndex();
         }
         return null;
     }
 
-    /**
-     * Classifies a conflict based on the change types involved.
-     */
     private MergeConflict.ConflictType classifyConflict(
             List<EChange<HierarchicalId>> ours,
             List<EChange<HierarchicalId>> theirs) {

@@ -44,16 +44,34 @@ public class GitStateLoader {
     public void checkoutStateAtCommit(String commitSha, Path tempDir) throws IOException, GitAPIException {
         LOGGER.info("Checking out state at commit {} into {}", commitSha.substring(0, 7), tempDir);
 
-        // Clone the repo into tempDir at the specific commit
-        try (Git git = Git.cloneRepository()
-                .setURI(repoRoot.toUri().toString())
-                .setDirectory(tempDir.toFile())
-                .setNoCheckout(true)
-                .call()) {
-            git.checkout()
-                    .setName(commitSha)
-                    .call();
-            LOGGER.debug("Checkout complete at {}", commitSha.substring(0, 7));
+        // Use JGit to read the commit's tree and extract files to tempDir.
+        // This avoids clone conflicts when the source repo has open file handles.
+        try (Git git = Git.open(repoRoot.toFile())) {
+            var repo = git.getRepository();
+            var revCommit = new org.eclipse.jgit.revwalk.RevWalk(repo)
+                    .parseCommit(repo.resolve(commitSha));
+            var tree = revCommit.getTree();
+
+            try (var treeWalk = new org.eclipse.jgit.treewalk.TreeWalk(repo)) {
+                treeWalk.addTree(tree);
+                treeWalk.setRecursive(true);
+                while (treeWalk.next()) {
+                    String path = treeWalk.getPathString();
+                    Path outFile = tempDir.resolve(path);
+                    Files.createDirectories(outFile.getParent());
+
+                    var objectId = treeWalk.getObjectId(0);
+                    var loader = repo.open(objectId);
+                    Files.write(outFile, loader.getBytes());
+                }
+            }
+        }
+        LOGGER.debug("Extracted {} files at commit {}", countFiles(tempDir), commitSha.substring(0, 7));
+    }
+
+    private long countFiles(Path dir) throws IOException {
+        try (var stream = Files.walk(dir)) {
+            return stream.filter(Files::isRegularFile).count();
         }
     }
 
