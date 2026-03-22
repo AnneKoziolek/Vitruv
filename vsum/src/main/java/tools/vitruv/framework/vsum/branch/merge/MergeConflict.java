@@ -15,12 +15,16 @@ import tools.vitruv.change.atomic.hid.HierarchicalId;
 public class MergeConflict {
 
     public enum ConflictType {
-        /** Both branches modify the same element's attribute(s). */
+        /** Both branches modify the same element's attribute(s) — direct user vs user. */
         MODIFY_MODIFY,
         /** Target branch deletes an element that source branch modifies. */
         DELETE_MODIFY,
         /** Source branch deletes an element that target branch modifies. */
-        MODIFY_DELETE
+        MODIFY_DELETE,
+        /** Derived change from replay(A) overwrites user change on B — indirect conflict. */
+        INDIRECT_CONFLICT,
+        /** User change from A overwrites derived state on B — non-blocking warning. */
+        USER_VS_DERIVED_WARNING
     }
 
     private final String elementId;

@@ -145,14 +145,24 @@ public class SemanticMergeEngine {
         String oursUriPrefix = oursDir.toAbsolutePath().toString();
 
         // 6. Replay each transaction separately (per-transaction restore/reactions)
-        //    After each transaction, check for indirect conflicts:
-        //    derived(replay(A)) vs user(B)
+        //    After each transaction:
+        //    - Check indirect conflicts: derived(replay(A)) vs user(B)
+        //    - Check warnings: user(A) vs derived(B)
         List<EChange<HierarchicalId>> allApplied = new ArrayList<>();
         List<MergeConflict> indirectConflicts = new ArrayList<>();
+        List<MergeConflict> warnings = new ArrayList<>();
+
+        // Collect user-authored footprints from target branch for conflict/warning checks
+        Set<String> oursUserFootprints = collectUuidFootprints(oursDtos);
 
         try {
             for (int i = 0; i < theirsTransactions.size(); i++) {
                 List<SemanticChangeLog.ChangeDto> txnDtos = theirsTransactions.get(i);
+
+                // Check user(A) vs derived(B) warnings BEFORE replay:
+                // If this transaction's user changes target elements whose state on B
+                // is derived (not in oursDtos), that's a warning.
+                warnings.addAll(detectUserVsDerivedWarnings(txnDtos, oursUserFootprints));
 
                 // Fresh deserializer per transaction (resets cache ID counter)
                 ChangeDtoDeserializer deserializer =
@@ -169,13 +179,15 @@ public class SemanticMergeEngine {
                 targetVsum.removeChangePropagationListener(derivedCapture);
                 allApplied.addAll(txnChanges);
 
-                // Check: did reactions overwrite user changes on target branch?
-                List<MergeConflict> indirect = detectIndirectConflicts(
-                        derivedCapture.getDerivedChanges(), oursDtos);
-                indirectConflicts.addAll(indirect);
+                // Check indirect conflicts AFTER replay: derived(replay(A)) vs user(B)
+                // Use the VSUM's UuidResolver to get per-element UUIDs for derived changes
+                indirectConflicts.addAll(detectIndirectConflicts(
+                        derivedCapture.getDerivedChanges(), oursDtos,
+                        targetVsum.getUuidResolver()));
 
-                LOGGER.info("Replayed transaction {}/{} ({} changes, {} indirect conflicts)",
-                        i + 1, theirsTransactions.size(), txnChanges.size(), indirect.size());
+                LOGGER.info("Replayed transaction {}/{} ({} changes, {} indirect conflicts, {} warnings)",
+                        i + 1, theirsTransactions.size(), txnChanges.size(),
+                        indirectConflicts.size(), warnings.size());
             }
         } catch (Exception e) {
             LOGGER.error("Replay failed: {}", e.getMessage(), e);
@@ -186,13 +198,19 @@ public class SemanticMergeEngine {
         targetVsum.dispose();
 
         if (!indirectConflicts.isEmpty()) {
-            LOGGER.warn("{} indirect conflict(s) detected (derived vs user)", indirectConflicts.size());
+            LOGGER.warn("{} indirect conflict(s): derived(replay(A)) vs user(B)",
+                    indirectConflicts.size());
+        }
+        if (!warnings.isEmpty()) {
+            LOGGER.info("{} warning(s): user(A) vs derived(B)", warnings.size());
         }
 
+        List<MergeConflict> allWarnings = new ArrayList<>(warnings);
         if (!resolutions.isEmpty() || !indirectConflicts.isEmpty()) {
-            return SemanticMergeResult.successWithResolutions(resolutions, allApplied, oursDir);
+            return SemanticMergeResult.successWithResolutions(
+                    resolutions, allApplied, allWarnings, oursDir);
         }
-        return SemanticMergeResult.success(allApplied, oursDir);
+        return SemanticMergeResult.success(allApplied, allWarnings, oursDir);
     }
 
     /**
@@ -304,64 +322,125 @@ public class SemanticMergeEngine {
     }
 
     /**
-     * Detects indirect conflicts: where derived changes (reactions) from replaying a
-     * source transaction overwrite user-authored changes on the target branch.
+     * Collects UUID#feature footprints from changelog DTOs.
+     */
+    private Set<String> collectUuidFootprints(List<SemanticChangeLog.ChangeDto> dtos) {
+        Set<String> footprints = new HashSet<>();
+        for (SemanticChangeLog.ChangeDto dto : dtos) {
+            if (dto.affectedElementUuid != null && dto.featureName != null) {
+                footprints.add(dto.affectedElementUuid + "#" + dto.featureName);
+            }
+        }
+        return footprints;
+    }
+
+    /**
+     * Detects indirect conflicts: derived(replay(A)) vs user(B).
      *
-     * <p>Implements Section 7.3 of the formalization: derived(replay(A)) vs user(B).
-     * Uses EClass#feature as the footprint key since derived changes are EObject-typed.
+     * <p>After replaying a source transaction, reactions (restore) produce consequential
+     * changes. If any of those derived changes modify an element+feature that the target
+     * branch's user explicitly changed, that's an indirect conflict.
+     *
+     * <p>Uses the VSUM's UuidResolver to get per-element UUIDs for the derived changes,
+     * enabling precise element-level (not type-level) conflict detection.
+     *
+     * <p>Implements Section 7.3 of the formalization.
      */
     private List<MergeConflict> detectIndirectConflicts(
             List<PropagatedChange> derivedChanges,
-            List<SemanticChangeLog.ChangeDto> oursDtos) {
+            List<SemanticChangeLog.ChangeDto> oursDtos,
+            tools.vitruv.change.atomic.uuid.UuidResolver uuidResolver) {
 
         List<MergeConflict> conflicts = new ArrayList<>();
 
-        // Extract write footprint of derived (consequential) changes
-        Set<String> derivedFootprint = new HashSet<>();
+        // Build target-branch user footprints: UUID#feature
+        Set<String> oursUserFootprints = collectUuidFootprints(oursDtos);
+        if (oursUserFootprints.isEmpty()) return conflicts;
+
+        // Extract derived footprints using UuidResolver for per-element identity
         for (PropagatedChange pc : derivedChanges) {
             VitruviusChange<EObject> consequential = pc.getConsequentialChanges();
             if (consequential == null || !consequential.containsConcreteChange()) continue;
+
             for (EChange<EObject> ec : consequential.getEChanges()) {
-                if (ec instanceof tools.vitruv.change.atomic.feature.FeatureEChange<EObject, ?> fc) {
-                    EObject element = fc.getAffectedElement();
-                    String featureName = fc.getAffectedFeature() != null
-                            ? fc.getAffectedFeature().getName() : null;
-                    if (element != null && featureName != null) {
-                        derivedFootprint.add(element.eClass().getName() + "#" + featureName);
-                    }
+                if (!(ec instanceof tools.vitruv.change.atomic.feature.FeatureEChange<EObject, ?> fc))
+                    continue;
+                EObject element = fc.getAffectedElement();
+                String featureName = fc.getAffectedFeature() != null
+                        ? fc.getAffectedFeature().getName() : null;
+                if (element == null || featureName == null) continue;
+
+                // Resolve the element's UUID for per-element matching
+                String uuid;
+                try {
+                    uuid = uuidResolver.getUuid(element).toString();
+                } catch (IllegalStateException e) {
+                    continue; // element not in UUID resolver (e.g., newly created by reaction)
+                }
+
+                String footprint = uuid + "#" + featureName;
+                if (oursUserFootprints.contains(footprint)) {
+                    conflicts.add(new MergeConflict(
+                            uuid, MergeConflict.ConflictType.INDIRECT_CONFLICT,
+                            uuid, featureName, null, null, null));
+                    LOGGER.warn("Indirect conflict: derived change from replay " +
+                            "overwrites user change on target: uuid={}, feature={}",
+                            uuid, featureName);
                 }
             }
         }
+        return conflicts;
+    }
 
-        if (derivedFootprint.isEmpty()) return conflicts;
+    /**
+     * Detects user(A) vs derived(B) warnings.
+     *
+     * <p>If a source transaction's user changes modify an element+feature that is NOT
+     * in the target branch's user-authored changes (i.e., the target state for that
+     * element+feature is derived, not user-authored), that's a warning.
+     *
+     * <p>Policy: replay proceeds, source user intent wins, warning is recorded.
+     *
+     * <p>Implements Section 7.2 of the formalization.
+     */
+    private List<MergeConflict> detectUserVsDerivedWarnings(
+            List<SemanticChangeLog.ChangeDto> theirsTxnDtos,
+            Set<String> oursUserFootprints) {
 
-        // Extract write footprint of target-branch user changes
-        Set<String> oursUserFootprint = new HashSet<>();
-        for (SemanticChangeLog.ChangeDto dto : oursDtos) {
-            if (dto.affectedEClassName != null && dto.featureName != null) {
-                oursUserFootprint.add(dto.affectedEClassName + "#" + dto.featureName);
+        List<MergeConflict> warnings = new ArrayList<>();
+
+        for (SemanticChangeLog.ChangeDto dto : theirsTxnDtos) {
+            if (dto.affectedElementUuid == null || dto.featureName == null) continue;
+
+            String footprint = dto.affectedElementUuid + "#" + dto.featureName;
+
+            // If the target branch has NO user-authored change for this element+feature,
+            // but the element exists on the target (it came from the base), then
+            // any derived state on B for this element was from reactions, not user intent.
+            // User(A) overwriting derived(B) is a warning, not a conflict.
+            //
+            // We can only detect this if the element UUID exists on both branches
+            // (from the common ancestor) but the target branch didn't explicitly change it.
+            // Skip if the footprint IS in ours user changes (that would be a direct conflict,
+            // already detected by UuidConflictDetector).
+            if (!oursUserFootprints.contains(footprint)) {
+                // Check: does the element exist on the target branch at all?
+                // If the UUID appears in ANY ours DTO, the element exists on B.
+                boolean elementExistsOnB = oursUserFootprints.stream()
+                        .anyMatch(fp -> fp.startsWith(dto.affectedElementUuid + "#"));
+                // Only warn if the element exists on B (otherwise it's a pure addition, no warning)
+                if (elementExistsOnB) {
+                    warnings.add(new MergeConflict(
+                            dto.affectedElementUuid,
+                            MergeConflict.ConflictType.USER_VS_DERIVED_WARNING,
+                            dto.affectedElementUuid, dto.featureName,
+                            null, null, String.valueOf(dto.newLiteralValue)));
+                    LOGGER.info("Warning: user(A) overwrites derived(B) state: uuid={}, feature={}",
+                            dto.affectedElementUuid, dto.featureName);
+                }
             }
         }
-
-        // Overlap = indirect conflict
-        Set<String> overlap = new HashSet<>(derivedFootprint);
-        overlap.retainAll(oursUserFootprint);
-
-        for (String fp : overlap) {
-            String[] parts = fp.split("#", 2);
-            String uuid = oursDtos.stream()
-                    .filter(d -> parts[0].equals(d.affectedEClassName)
-                            && parts[1].equals(d.featureName))
-                    .map(d -> d.affectedElementUuid)
-                    .findFirst().orElse(parts[0]);
-
-            conflicts.add(new MergeConflict(
-                    uuid, MergeConflict.ConflictType.MODIFY_MODIFY,
-                    uuid, parts[1], null, null, null));
-            LOGGER.warn("Indirect conflict: derived change overwrites user change " +
-                    "on target branch: {}#{}", parts[0], parts[1]);
-        }
-        return conflicts;
+        return warnings;
     }
 
     /**
