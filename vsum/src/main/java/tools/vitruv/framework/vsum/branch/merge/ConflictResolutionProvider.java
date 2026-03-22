@@ -9,9 +9,17 @@ import java.util.List;
 @FunctionalInterface
 public interface ConflictResolutionProvider {
 
+    /**
+     * Resolves the given conflicts by choosing OURS or THEIRS for each.
+     *
+     * @param conflicts the detected merge conflicts
+     * @return one resolution per conflict
+     */
     List<ConflictResolution> resolve(List<MergeConflict> conflicts);
 
-    /** Always chooses "ours" for all conflicts. */
+    /**
+     * Returns a provider that always chooses OURS (keep target branch values).
+     */
     static ConflictResolutionProvider chooseAllOurs() {
         return conflicts -> conflicts.stream()
                 .map(c -> new ConflictResolution(c.getElementId(),
@@ -19,7 +27,9 @@ public interface ConflictResolutionProvider {
                 .toList();
     }
 
-    /** Always chooses "theirs" for all conflicts. */
+    /**
+     * Returns a provider that always chooses THEIRS (accept source branch values).
+     */
     static ConflictResolutionProvider chooseAllTheirs() {
         return conflicts -> conflicts.stream()
                 .map(c -> new ConflictResolution(c.getElementId(),

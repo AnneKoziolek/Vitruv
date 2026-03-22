@@ -41,12 +41,12 @@ branch/
 │   ├── PostCommitTriggerFile.java  # post-commit → watcher
 │   ├── MergeTriggerFile.java       # post-merge → watcher
 │   └── MergeResultFile.java        # watcher → post-merge result
-└── merge/                          # NEW: Semantic three-way merge
-    ├── SemanticChangeLog.java      # Serialize/deserialize EChanges per commit (JSON)
+└── merge/                          # Semantic three-way merge
+    ├── SemanticChangeLog.java      # Serialize/deserialize EChanges per commit (JSON DTOs)
     ├── ChangeLogCapture.java       # ChangePropagationListener that buffers primary changes
-    ├── ChangeExtractor.java        # Read changelogs for a commit range
+    ├── ChangeDtoDeserializer.java  # Reconstruct EChange<HierarchicalId> from JSON DTOs
     ├── GitStateLoader.java         # Load VSUM state from a specific Git commit
-    ├── ConflictDetector.java       # Element-level conflict detection
+    ├── UuidConflictDetector.java   # UUID-based conflict detection on changelog DTOs
     ├── MergeConflict.java          # Conflict data class
     ├── SemanticMergeResult.java    # Merge outcome data class
     ├── SemanticMergeEngine.java    # Core three-way merge algorithm
@@ -160,15 +160,14 @@ Each DTO captures the **primary user changes** only — derived changes (from re
    - Independent additions (different UUIDs) → NOT a conflict
 4. If conflicts + no resolver → return CONFLICT
    If conflicts + resolver → filter DTOs by ours/theirs choice
-5. Load target VSUM from ours state
-6. Create ChangeRecordingView on target VSUM
-7. Apply three-way diff (base vs theirs) onto view:
-   - New elements in theirs: deep-copy into view
-   - Modified attributes: apply theirs' values
-   - Deleted elements: remove from view
-8. view.commitChanges() records individual EMF operations → propagateChange()
-   → reactions fire → derived models regenerated
-9. Return SemanticMergeResult (SUCCESS, CONFLICT, or SUCCESS_WITH_RESOLUTIONS)
+5. Deserialize filtered DTOs into live EChange<HierarchicalId> via ChangeDtoDeserializer
+6. Load target VSUM from ours state
+7. Replay on a copy ResourceSet (same pattern as IdentityMappingViewType.commitViewChanges):
+   a. Copy VSUM's model resources + UUID mappings into a fresh ResourceSet
+   b. resolveAndApply(changes) — resolves HierarchicalId→EObject on the copy
+   c. assignIds(resolved) — assigns UUIDs on the copy
+   d. propagateChange(uuidChange) — applies to the VSUM, fires reactions
+8. Return SemanticMergeResult (SUCCESS, CONFLICT, or SUCCESS_WITH_RESOLUTIONS)
 ```
 
 ### Usage

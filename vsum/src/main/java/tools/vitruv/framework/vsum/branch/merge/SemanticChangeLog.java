@@ -33,17 +33,15 @@ import tools.vitruv.change.atomic.root.RootEChange;
 /**
  * A semantic change log that stores the primary {@link EChange}s for a single Git commit.
  *
- * <p>Two serialization formats are supported:
- * <ul>
- *   <li><strong>XMI</strong> (primary): EChanges are EMF EObjects serialized via standard XMI.
- *       HierarchicalId objects referenced by EChanges are added as additional root contents
- *       so EMF can serialize the non-containment references.</li>
- *   <li><strong>JSON DTO</strong> (companion): Lightweight DTOs for human readability and
- *       UUID-based conflict detection.</li>
- * </ul>
+ * <p>Changes are serialized as JSON DTOs capturing change type, affected element IDs (both
+ * HierarchicalId and UUID), feature names, and values. The DTOs are used both for UUID-based
+ * conflict detection and for reconstructing live EChange objects via {@link ChangeDtoDeserializer}.
  *
- * <p>Storage location: {@code .vitruvius/semantic-changelogs/<commitSha>.changelog} (XMI)
- * and {@code .vitruvius/semantic-changelogs/<commitSha>.changelog.json} (JSON DTO)
+ * <p>Note: XMI serialization was attempted but fails because the EChange Ecore metamodel
+ * defines element references via generic {@code ETypeParameter} with bounds {@code EJavaObject},
+ * preventing proper cross-reference serialization of HierarchicalId objects.
+ *
+ * <p>Storage location: {@code .vitruvius/semantic-changelogs/<key>.changelog.json}
  */
 public class SemanticChangeLog {
 
