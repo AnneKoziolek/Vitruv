@@ -228,37 +228,110 @@ public class SemanticMergeEngine {
      * <p>This separation ensures that changes are not double-applied: resolveAndApply
      * modifies the copy, and propagateChange modifies the VSUM.
      */
+    /**
+     * Replays deserialized EChanges onto a target VSUM through a ChangeRecordingView.
+     *
+     * <p>The deserialized EChanges describe the INTENT (what to change). We resolve
+     * HierarchicalIds to actual EObjects in the view, apply the changes directly to
+     * the model elements, then {@code view.commitChanges()} captures the individual
+     * EMF notifications and propagates them through the reaction engine.
+     *
+     * <p>This ensures reactions fire correctly, enabling transitive propagation across
+     * coupled models (e.g., model→model2→model3). Using a ChangeRecordingView
+     * generates the exact EMF notifications that reaction pattern-matching expects.
+     */
+    @SuppressWarnings("unchecked")
     private void replayChanges(InternalVirtualModel targetVsum,
                                 List<EChange<HierarchicalId>> changes) {
 
-        // Create a copy ResourceSet with copies of the VSUM's model resources
-        ResourceSet copyResourceSet = withGlobalFactories(new ResourceSetImpl());
-        UuidResolver copyUuidResolver = UuidResolver.create(copyResourceSet);
+        // Create a ChangeRecordingView on all model objects
+        var selector = targetVsum.createSelector(
+                tools.vitruv.framework.views.ViewTypeFactory.createIdentityMappingViewType("merge-replay"));
+        targetVsum.getViewSourceModels().stream()
+                .flatMap(r -> r.getContents().stream())
+                .forEach(root -> selector.setSelected(root, true));
+        var view = selector.createView().withChangeRecordingTrait();
 
-        // Copy each model resource and map UUIDs
-        java.util.Map<Resource, Resource> resourceMapping = new java.util.HashMap<>();
-        for (Resource sourceResource : targetVsum.getViewSourceModels()) {
-            Resource copyResource = copyResourceSet.createResource(sourceResource.getURI());
-            copyResource.getContents().addAll(EcoreUtil.copyAll(sourceResource.getContents()));
-            resourceMapping.put(sourceResource, copyResource);
+        // Get the view's ResourceSet and create a HierarchicalIdResolver for it
+        ResourceSet viewRs = view.getRootObjects(EObject.class).iterator().next()
+                .eResource().getResourceSet();
+        var idResolver = tools.vitruv.change.atomic.hid.internal.HierarchicalIdResolver.create(viewRs);
+
+        // Apply each deserialized change to the view's model elements
+        for (EChange<HierarchicalId> eChange : changes) {
+            applyChangeToView(eChange, idResolver, viewRs);
         }
-        targetVsum.getUuidResolver().resolveResources(resourceMapping, copyUuidResolver);
 
-        // Create resolvers for the COPY ResourceSet
-        VitruviusChangeResolver<HierarchicalId> idResolver =
-                VitruviusChangeResolverFactory.forHierarchicalIds(copyResourceSet);
-        VitruviusChangeResolver<Uuid> uuidResolver =
-                VitruviusChangeResolverFactory.forUuids(copyUuidResolver);
+        // Commit: ChangeRecordingView captures EMF notifications → propagateChange → reactions fire
+        view.commitChanges();
+    }
 
-        VitruviusChange<HierarchicalId> change =
-                VitruviusChangeFactory.getInstance().createTransactionalChange(changes);
+    /**
+     * Applies a single deserialized EChange to a view's model by resolving the
+     * HierarchicalId to an EObject and performing the operation directly.
+     * This generates proper EMF notifications that trigger reactions.
+     */
+    @SuppressWarnings("unchecked")
+    private void applyChangeToView(EChange<HierarchicalId> eChange,
+                                    tools.vitruv.change.atomic.hid.internal.HierarchicalIdResolver idResolver,
+                                    ResourceSet viewRs) {
+        if (eChange instanceof tools.vitruv.change.atomic.eobject.CreateEObject<HierarchicalId> ce) {
+            // Create a new EObject and register it with the resolver
+            EObject created = EcoreUtil.create(ce.getAffectedEObjectType());
+            idResolver.getAndUpdateId(created);
 
-        // Resolve and apply on the COPY (not the VSUM)
-        VitruviusChange<EObject> resolved = idResolver.resolveAndApply(change);
-        // Assign UUIDs on the COPY
-        VitruviusChange<Uuid> uuidChange = uuidResolver.assignIds(resolved);
-        // Propagate on the VSUM (applies to real models + fires reactions)
-        targetVsum.propagateChange(uuidChange);
+        } else if (eChange instanceof tools.vitruv.change.atomic.feature.reference.InsertEReference<HierarchicalId> ir) {
+            EObject container = idResolver.getEObject(ir.getAffectedElement());
+            EObject newElement;
+            try {
+                newElement = idResolver.getEObject(ir.getNewValue());
+            } catch (IllegalStateException e) {
+                LOGGER.warn("Cannot resolve newValue for InsertEReference: {}", ir.getNewValue());
+                return;
+            }
+            var list = (List<EObject>) container.eGet(ir.getAffectedFeature());
+            if (ir.getIndex() >= 0 && ir.getIndex() <= list.size()) {
+                list.add(ir.getIndex(), newElement);
+            } else {
+                list.add(newElement);
+            }
+
+        } else if (eChange instanceof tools.vitruv.change.atomic.feature.attribute.ReplaceSingleValuedEAttribute<HierarchicalId, ?> rsa) {
+            EObject element = idResolver.getEObject(rsa.getAffectedElement());
+            element.eSet(rsa.getAffectedFeature(), rsa.getNewValue());
+
+        } else if (eChange instanceof tools.vitruv.change.atomic.feature.reference.RemoveEReference<HierarchicalId> rr) {
+            EObject container = idResolver.getEObject(rr.getAffectedElement());
+            var list = (List<EObject>) container.eGet(rr.getAffectedFeature());
+            if (rr.getIndex() >= 0 && rr.getIndex() < list.size()) {
+                list.remove(rr.getIndex());
+            }
+
+        } else if (eChange instanceof tools.vitruv.change.atomic.eobject.DeleteEObject<HierarchicalId> de) {
+            try {
+                EObject element = idResolver.getEObject(de.getAffectedElement());
+                EcoreUtil.remove(element);
+            } catch (IllegalStateException e) {
+                LOGGER.debug("Element already removed: {}", de.getAffectedElement());
+            }
+
+        } else if (eChange instanceof tools.vitruv.change.atomic.feature.attribute.InsertEAttributeValue<HierarchicalId, ?> ia) {
+            EObject element = idResolver.getEObject(ia.getAffectedElement());
+            var list = (List<Object>) element.eGet(ia.getAffectedFeature());
+            list.add(ia.getIndex(), ia.getNewValue());
+
+        } else if (eChange instanceof tools.vitruv.change.atomic.root.InsertRootEObject<HierarchicalId> iro) {
+            try {
+                EObject newRoot = idResolver.getEObject(iro.getNewValue());
+                Resource resource = viewRs.getResource(
+                        org.eclipse.emf.common.util.URI.createURI(iro.getUri()), false);
+                if (resource != null && iro.getIndex() <= resource.getContents().size()) {
+                    resource.getContents().add(iro.getIndex(), newRoot);
+                }
+            } catch (IllegalStateException e) {
+                LOGGER.debug("Cannot resolve root element: {}", iro.getNewValue());
+            }
+        }
     }
 
     /**
