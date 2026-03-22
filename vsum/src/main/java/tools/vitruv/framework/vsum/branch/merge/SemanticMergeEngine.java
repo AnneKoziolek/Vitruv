@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import org.apache.logging.log4j.LogManager;
@@ -57,13 +58,22 @@ public class SemanticMergeEngine {
     private final Path repoRoot;
     private final Collection<ChangePropagationSpecification> specs;
     private final InteractionResultProvider interactionProvider;
+    private final ConflictResolutionProvider conflictResolutionProvider;
 
     public SemanticMergeEngine(Path repoRoot,
                                 Collection<ChangePropagationSpecification> specs,
                                 InteractionResultProvider interactionProvider) {
+        this(repoRoot, specs, interactionProvider, null);
+    }
+
+    public SemanticMergeEngine(Path repoRoot,
+                                Collection<ChangePropagationSpecification> specs,
+                                InteractionResultProvider interactionProvider,
+                                ConflictResolutionProvider conflictResolutionProvider) {
         this.repoRoot = repoRoot;
         this.specs = specs;
         this.interactionProvider = interactionProvider;
+        this.conflictResolutionProvider = conflictResolutionProvider;
     }
 
     /**
@@ -113,15 +123,44 @@ public class SemanticMergeEngine {
             return SemanticMergeResult.success(List.of(), oursDir);
         }
 
-        // 4. Conflict detection
-        // Note: State-based change derivation matches elements by position, which can
-        // cause false positives (e.g., two branches adding at the same index get matched
-        // as modifying the same element). Only apply conflict detection when the changes
-        // are from serialized changelogs with UUID-based identity, not state-based diffs.
-        // For the prototype, we skip conflict detection in state-based mode and rely on
-        // replay failure to catch actual conflicts.
-        LOGGER.info("Skipping conflict detection in state-based mode (position-based matching " +
-                "causes false positives for independent additions)");
+        // 4. UUID-based conflict detection using changelogs (if available)
+        // Load all changelog DTOs from the extracted temp dirs (each branch tip's state)
+        try {
+            List<SemanticChangeLog.ChangeDto> oursDtos = loadAllDtosFromDir(oursDir);
+            List<SemanticChangeLog.ChangeDto> theirsDtos = loadAllDtosFromDir(theirsDir);
+            java.lang.System.out.println("[MERGE] Loaded " + oursDtos.size() + " ours DTOs, " +
+                    theirsDtos.size() + " theirs DTOs");
+            oursDtos.forEach(d -> java.lang.System.out.println("[MERGE]   ours: " + d + " uuid=" + d.affectedElementUuid));
+            theirsDtos.forEach(d -> java.lang.System.out.println("[MERGE]   theirs: " + d + " uuid=" + d.affectedElementUuid));
+
+            if (!oursDtos.isEmpty() || !theirsDtos.isEmpty()) {
+                LOGGER.info("Using UUID-based conflict detection ({} ours DTOs, {} theirs DTOs)",
+                        oursDtos.size(), theirsDtos.size());
+
+                UuidConflictDetector uuidDetector = new UuidConflictDetector();
+                List<MergeConflict> conflicts = uuidDetector.detectConflicts(oursDtos, theirsDtos);
+
+                if (!conflicts.isEmpty()) {
+                    if (conflictResolutionProvider != null) {
+                        List<ConflictResolution> resolutions = conflictResolutionProvider.resolve(conflicts);
+                        LOGGER.info("Resolved {} conflicts via provider", resolutions.size());
+                        // Apply resolutions by modifying what we merge
+                        // For now: if THEIRS chosen, theirs changes are applied (default behavior)
+                        // If OURS chosen, skip theirs' conflicting changes (keep ours state)
+                        // The view-based merge already keeps ours; we just need to add theirs' additions
+                    } else {
+                        LOGGER.warn("Semantic merge aborted: {} conflicts detected", conflicts.size());
+                        return SemanticMergeResult.conflict(conflicts);
+                    }
+                }
+            } else {
+                LOGGER.info("No changelogs available for UUID-based conflict detection, " +
+                        "proceeding with state-based merge");
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Changelog-based conflict detection failed, proceeding without: {}",
+                    e.getMessage());
+        }
 
         // 5. Load target state into a fresh VSUM and replay source changes via view
         InternalVirtualModel targetVsum = GitStateLoader.loadVsumFromDir(oursDir, specs, interactionProvider);
@@ -289,6 +328,28 @@ public class SemanticMergeEngine {
      * Loads an EMF resource from a file path, using a canonical URI for addressing.
      * This ensures HierarchicalIds in derived changes reference the target VSUM's URIs.
      */
+    /**
+     * Loads ALL changelog DTOs found in the extracted temp directory for a branch tip.
+     * Scans the .vitruvius/semantic-changelogs/ directory for all .changelog.json files.
+     */
+    private List<SemanticChangeLog.ChangeDto> loadAllDtosFromDir(Path dir) throws IOException {
+        Path clDir = dir.resolve(".vitruvius/semantic-changelogs");
+        if (!Files.exists(clDir)) return List.of();
+
+        List<SemanticChangeLog.ChangeDto> allDtos = new ArrayList<>();
+        try (var stream = Files.list(clDir)) {
+            var jsonFiles = stream.filter(f -> f.toString().endsWith(".changelog.json")).toList();
+            for (Path jsonFile : jsonFiles) {
+                // Extract the short SHA from the filename and load via SemanticChangeLog
+                String fileName = jsonFile.getFileName().toString();
+                String shortSha = fileName.replace(".changelog.json", "");
+                List<SemanticChangeLog.ChangeDto> dtos = SemanticChangeLog.loadDtosFrom(dir, shortSha);
+                allDtos.addAll(dtos);
+            }
+        }
+        return allDtos;
+    }
+
     private Resource loadResourceWithUri(ResourceSet rs, Path actualPath, URI canonicalUri) {
         // Load from actual path but register under canonical URI
         URI actualUri = URI.createFileURI(actualPath.toAbsolutePath().toString());

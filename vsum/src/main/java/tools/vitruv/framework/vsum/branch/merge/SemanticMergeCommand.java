@@ -30,16 +30,27 @@ public class SemanticMergeCommand {
      * @param interactionProvider user interaction provider for VSUM creation
      * @return the merge result
      */
+    /** Executes without conflict resolution (aborts on conflict). */
     public SemanticMergeResult execute(
             Path repoRoot,
             String sourceBranch,
             String targetBranch,
             Collection<ChangePropagationSpecification> specs,
             InteractionResultProvider interactionProvider) throws Exception {
+        return execute(repoRoot, sourceBranch, targetBranch, specs, interactionProvider, null);
+    }
+
+    /** Executes with optional conflict resolution provider. */
+    public SemanticMergeResult execute(
+            Path repoRoot,
+            String sourceBranch,
+            String targetBranch,
+            Collection<ChangePropagationSpecification> specs,
+            InteractionResultProvider interactionProvider,
+            ConflictResolutionProvider conflictResolutionProvider) throws Exception {
 
         LOGGER.info("Semantic merge: {} -> {}", sourceBranch, targetBranch);
 
-        // Resolve branch names to commit SHAs
         String oursSha;
         String theirsSha;
         try (Git git = Git.open(repoRoot.toFile())) {
@@ -57,15 +68,14 @@ public class SemanticMergeCommand {
             theirsSha = theirsRef.getObjectId().getName();
         }
 
-        // Find merge base
         GitStateLoader loader = new GitStateLoader(repoRoot);
         String baseSha = loader.findMergeBase(oursSha, theirsSha);
         if (baseSha == null) {
             throw new IOException("No common ancestor between " + targetBranch + " and " + sourceBranch);
         }
 
-        // Run the merge engine
-        SemanticMergeEngine engine = new SemanticMergeEngine(repoRoot, specs, interactionProvider);
+        SemanticMergeEngine engine = new SemanticMergeEngine(
+                repoRoot, specs, interactionProvider, conflictResolutionProvider);
         SemanticMergeResult result = engine.merge(baseSha, oursSha, theirsSha);
 
         LOGGER.info("Semantic merge result: {}", result);

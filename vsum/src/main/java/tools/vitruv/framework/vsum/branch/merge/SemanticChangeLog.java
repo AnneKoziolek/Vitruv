@@ -5,7 +5,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 import org.apache.logging.log4j.LogManager;
@@ -53,17 +55,26 @@ public class SemanticChangeLog {
     private final String commitSha;
     private final String branch;
     private final List<EChange<HierarchicalId>> primaryChanges;
+    private final Map<String, String> uuidMappings; // uuid → hierarchicalId
 
     public SemanticChangeLog(String commitSha, String branch,
                              List<EChange<HierarchicalId>> primaryChanges) {
+        this(commitSha, branch, primaryChanges, Map.of());
+    }
+
+    public SemanticChangeLog(String commitSha, String branch,
+                             List<EChange<HierarchicalId>> primaryChanges,
+                             Map<String, String> uuidMappings) {
         this.commitSha = Objects.requireNonNull(commitSha, "commitSha must not be null");
         this.branch = Objects.requireNonNull(branch, "branch must not be null");
         this.primaryChanges = Collections.unmodifiableList(new ArrayList<>(primaryChanges));
+        this.uuidMappings = Map.copyOf(uuidMappings);
     }
 
     public String getCommitSha() { return commitSha; }
     public String getBranch() { return branch; }
     public List<EChange<HierarchicalId>> getPrimaryChanges() { return primaryChanges; }
+    public Map<String, String> getUuidMappings() { return uuidMappings; }
 
     /**
      * Persists this change log as JSON DTOs.
@@ -132,12 +143,23 @@ public class SemanticChangeLog {
     private void saveToJson(Path jsonPath) throws IOException {
         List<ChangeDto> dtos = new ArrayList<>();
         for (EChange<HierarchicalId> change : primaryChanges) {
-            dtos.add(ChangeDto.fromEChange(change));
+            ChangeDto dto = ChangeDto.fromEChange(change);
+            // Enrich with UUID from mapping if available
+            if (dto.affectedElementId != null && uuidMappings.containsValue(dto.affectedElementId)) {
+                for (var entry : uuidMappings.entrySet()) {
+                    if (entry.getValue().equals(dto.affectedElementId)) {
+                        dto.affectedElementUuid = entry.getKey();
+                        break;
+                    }
+                }
+            }
+            dtos.add(dto);
         }
         ChangeLogDto logDto = new ChangeLogDto();
         logDto.commitSha = commitSha;
         logDto.branch = branch;
         logDto.changes = dtos;
+        logDto.uuidMappings = uuidMappings.isEmpty() ? null : new HashMap<>(uuidMappings);
         Files.writeString(jsonPath, GSON.toJson(logDto));
     }
 
@@ -154,11 +176,14 @@ public class SemanticChangeLog {
         String commitSha;
         String branch;
         List<ChangeDto> changes;
+        Map<String, String> uuidMappings; // uuid → hierarchicalId
     }
 
     public static class ChangeDto {
         public String changeType;
         public String affectedElementId;
+        public String affectedElementUuid; // UUID for cross-branch identity
+        public String affectedEClassName;  // EClass name for feature resolution
         public String featureName;
         public String oldValueId;
         public String newValueId;
@@ -177,6 +202,10 @@ public class SemanticChangeLog {
                 dto.affectedElementId = idToString(fc.getAffectedElement());
                 dto.featureName = fc.getAffectedFeature() != null
                         ? fc.getAffectedFeature().getName() : null;
+                // Capture EClass name for feature resolution during deserialization
+                if (fc.getAffectedFeature() != null && fc.getAffectedFeature().getEContainingClass() != null) {
+                    dto.affectedEClassName = fc.getAffectedFeature().getEContainingClass().getName();
+                }
             }
             if (change instanceof EObjectExistenceEChange<HierarchicalId> ec) {
                 dto.affectedElementId = idToString(ec.getAffectedElement());
