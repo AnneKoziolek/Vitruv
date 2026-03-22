@@ -5,6 +5,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -26,10 +27,12 @@ import tools.vitruv.change.atomic.uuid.UuidResolver;
 import tools.vitruv.change.atomic.EChange;
 import tools.vitruv.change.atomic.hid.HierarchicalId;
 import tools.vitruv.change.atomic.uuid.Uuid;
+import tools.vitruv.change.composite.description.PropagatedChange;
 import tools.vitruv.change.composite.description.VitruviusChange;
 import tools.vitruv.change.composite.description.VitruviusChangeFactory;
 import tools.vitruv.change.composite.description.VitruviusChangeResolver;
 import tools.vitruv.change.composite.description.VitruviusChangeResolverFactory;
+import tools.vitruv.change.composite.propagation.ChangePropagationListener;
 import tools.vitruv.change.interaction.InteractionResultProvider;
 import tools.vitruv.change.propagation.ChangePropagationSpecification;
 import tools.vitruv.framework.vsum.internal.InternalVirtualModel;
@@ -123,27 +126,57 @@ public class SemanticMergeEngine {
             }
         }
 
-        // 4. Deserialize DTOs into live EChange<HierarchicalId> objects
-        String theirsUriPrefix = theirsDir.toAbsolutePath().toString();
-        String oursUriPrefix = oursDir.toAbsolutePath().toString();
-        ChangeDtoDeserializer deserializer = new ChangeDtoDeserializer(theirsUriPrefix, oursUriPrefix);
-        List<EChange<HierarchicalId>> theirsChanges = deserializer.deserializeAll(theirsDtos);
-
-        LOGGER.info("Deserialized {} EChanges for replay", theirsChanges.size());
-
-        if (theirsChanges.isEmpty()) {
-            return !resolutions.isEmpty()
-                    ? SemanticMergeResult.successWithResolutions(resolutions, List.of(), oursDir)
-                    : SemanticMergeResult.success(List.of(), oursDir);
+        // 4. Load changelog DTOs grouped by transaction for per-transaction replay
+        List<List<SemanticChangeLog.ChangeDto>> theirsTransactions =
+                loadTransactionsFromDir(theirsDir);
+        // Apply conflict resolution filtering to each transaction
+        if (!resolutions.isEmpty()) {
+            final var finalConflicts = conflicts;
+            final var finalResolutions = resolutions;
+            theirsTransactions = theirsTransactions.stream()
+                    .map(txn -> filterByResolutions(txn, finalConflicts, finalResolutions))
+                    .filter(txn -> !txn.isEmpty())
+                    .toList();
         }
 
         // 5. Load target VSUM from ours state
         InternalVirtualModel targetVsum = GitStateLoader.loadVsumFromDir(oursDir, specs, interactionProvider);
+        String theirsUriPrefix = theirsDir.toAbsolutePath().toString();
+        String oursUriPrefix = oursDir.toAbsolutePath().toString();
 
-        // 6. Replay: resolveAndApply → assignIds → propagateChange
+        // 6. Replay each transaction separately (per-transaction restore/reactions)
+        //    After each transaction, check for indirect conflicts:
+        //    derived(replay(A)) vs user(B)
+        List<EChange<HierarchicalId>> allApplied = new ArrayList<>();
+        List<MergeConflict> indirectConflicts = new ArrayList<>();
+
         try {
-            replayChanges(targetVsum, theirsChanges);
-            LOGGER.info("Successfully replayed {} changes onto target VSUM", theirsChanges.size());
+            for (int i = 0; i < theirsTransactions.size(); i++) {
+                List<SemanticChangeLog.ChangeDto> txnDtos = theirsTransactions.get(i);
+
+                // Fresh deserializer per transaction (resets cache ID counter)
+                ChangeDtoDeserializer deserializer =
+                        new ChangeDtoDeserializer(theirsUriPrefix, oursUriPrefix);
+                List<EChange<HierarchicalId>> txnChanges = deserializer.deserializeAll(txnDtos);
+                if (txnChanges.isEmpty()) continue;
+
+                // Capture derived changes from this transaction's reactions
+                DerivedChangeCapture derivedCapture = new DerivedChangeCapture();
+                targetVsum.addChangePropagationListener(derivedCapture);
+
+                replayChanges(targetVsum, txnChanges);
+
+                targetVsum.removeChangePropagationListener(derivedCapture);
+                allApplied.addAll(txnChanges);
+
+                // Check: did reactions overwrite user changes on target branch?
+                List<MergeConflict> indirect = detectIndirectConflicts(
+                        derivedCapture.getDerivedChanges(), oursDtos);
+                indirectConflicts.addAll(indirect);
+
+                LOGGER.info("Replayed transaction {}/{} ({} changes, {} indirect conflicts)",
+                        i + 1, theirsTransactions.size(), txnChanges.size(), indirect.size());
+            }
         } catch (Exception e) {
             LOGGER.error("Replay failed: {}", e.getMessage(), e);
             targetVsum.dispose();
@@ -152,9 +185,14 @@ public class SemanticMergeEngine {
 
         targetVsum.dispose();
 
-        return !resolutions.isEmpty()
-                ? SemanticMergeResult.successWithResolutions(resolutions, theirsChanges, oursDir)
-                : SemanticMergeResult.success(theirsChanges, oursDir);
+        if (!indirectConflicts.isEmpty()) {
+            LOGGER.warn("{} indirect conflict(s) detected (derived vs user)", indirectConflicts.size());
+        }
+
+        if (!resolutions.isEmpty() || !indirectConflicts.isEmpty()) {
+            return SemanticMergeResult.successWithResolutions(resolutions, allApplied, oursDir);
+        }
+        return SemanticMergeResult.success(allApplied, oursDir);
     }
 
     /**
@@ -238,19 +276,111 @@ public class SemanticMergeEngine {
     }
 
     /**
-     * Loads ALL changelog DTOs from a directory's .vitruvius/semantic-changelogs/.
+     * Loads ALL changelog DTOs from a directory, flat.
      */
     private List<SemanticChangeLog.ChangeDto> loadAllDtosFromDir(Path dir) throws IOException {
+        return loadTransactionsFromDir(dir).stream().flatMap(List::stream).toList();
+    }
+
+    /**
+     * Loads changelog DTOs grouped by transaction (one list per changelog file).
+     * Each file represents one user commit = one transaction.
+     */
+    private List<List<SemanticChangeLog.ChangeDto>> loadTransactionsFromDir(Path dir) throws IOException {
         Path clDir = dir.resolve(".vitruvius/semantic-changelogs");
         if (!Files.exists(clDir)) return List.of();
 
-        List<SemanticChangeLog.ChangeDto> allDtos = new ArrayList<>();
+        List<List<SemanticChangeLog.ChangeDto>> transactions = new ArrayList<>();
         try (var stream = Files.list(clDir)) {
             for (Path jsonFile : stream.filter(f -> f.toString().endsWith(".changelog.json")).toList()) {
                 String shortSha = jsonFile.getFileName().toString().replace(".changelog.json", "");
-                allDtos.addAll(SemanticChangeLog.loadDtosFrom(dir, shortSha));
+                List<SemanticChangeLog.ChangeDto> dtos = SemanticChangeLog.loadDtosFrom(dir, shortSha);
+                if (!dtos.isEmpty()) {
+                    transactions.add(dtos);
+                }
             }
         }
-        return allDtos;
+        return transactions;
+    }
+
+    /**
+     * Detects indirect conflicts: where derived changes (reactions) from replaying a
+     * source transaction overwrite user-authored changes on the target branch.
+     *
+     * <p>Implements Section 7.3 of the formalization: derived(replay(A)) vs user(B).
+     * Uses EClass#feature as the footprint key since derived changes are EObject-typed.
+     */
+    private List<MergeConflict> detectIndirectConflicts(
+            List<PropagatedChange> derivedChanges,
+            List<SemanticChangeLog.ChangeDto> oursDtos) {
+
+        List<MergeConflict> conflicts = new ArrayList<>();
+
+        // Extract write footprint of derived (consequential) changes
+        Set<String> derivedFootprint = new HashSet<>();
+        for (PropagatedChange pc : derivedChanges) {
+            VitruviusChange<EObject> consequential = pc.getConsequentialChanges();
+            if (consequential == null || !consequential.containsConcreteChange()) continue;
+            for (EChange<EObject> ec : consequential.getEChanges()) {
+                if (ec instanceof tools.vitruv.change.atomic.feature.FeatureEChange<EObject, ?> fc) {
+                    EObject element = fc.getAffectedElement();
+                    String featureName = fc.getAffectedFeature() != null
+                            ? fc.getAffectedFeature().getName() : null;
+                    if (element != null && featureName != null) {
+                        derivedFootprint.add(element.eClass().getName() + "#" + featureName);
+                    }
+                }
+            }
+        }
+
+        if (derivedFootprint.isEmpty()) return conflicts;
+
+        // Extract write footprint of target-branch user changes
+        Set<String> oursUserFootprint = new HashSet<>();
+        for (SemanticChangeLog.ChangeDto dto : oursDtos) {
+            if (dto.affectedEClassName != null && dto.featureName != null) {
+                oursUserFootprint.add(dto.affectedEClassName + "#" + dto.featureName);
+            }
+        }
+
+        // Overlap = indirect conflict
+        Set<String> overlap = new HashSet<>(derivedFootprint);
+        overlap.retainAll(oursUserFootprint);
+
+        for (String fp : overlap) {
+            String[] parts = fp.split("#", 2);
+            String uuid = oursDtos.stream()
+                    .filter(d -> parts[0].equals(d.affectedEClassName)
+                            && parts[1].equals(d.featureName))
+                    .map(d -> d.affectedElementUuid)
+                    .findFirst().orElse(parts[0]);
+
+            conflicts.add(new MergeConflict(
+                    uuid, MergeConflict.ConflictType.MODIFY_MODIFY,
+                    uuid, parts[1], null, null, null));
+            LOGGER.warn("Indirect conflict: derived change overwrites user change " +
+                    "on target branch: {}#{}", parts[0], parts[1]);
+        }
+        return conflicts;
+    }
+
+    /**
+     * Captures derived (propagated) changes during a single {@code propagateChange()} call.
+     * Used for indirect conflict detection after each replayed transaction.
+     */
+    private static class DerivedChangeCapture implements ChangePropagationListener {
+        private final List<PropagatedChange> derivedChanges = new ArrayList<>();
+
+        @Override
+        public void startedChangePropagation(VitruviusChange<Uuid> change) { }
+
+        @Override
+        public void finishedChangePropagation(Iterable<PropagatedChange> propagatedChanges) {
+            for (PropagatedChange pc : propagatedChanges) {
+                derivedChanges.add(pc);
+            }
+        }
+
+        public List<PropagatedChange> getDerivedChanges() { return derivedChanges; }
     }
 }
