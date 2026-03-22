@@ -126,7 +126,7 @@ public class ChangeDtoDeserializer {
 
     private EChange<HierarchicalId> deserializeInsertRoot(SemanticChangeLog.ChangeDto dto) {
         InsertRootEObject<HierarchicalId> c = RootFactory.eINSTANCE.createInsertRootEObject();
-        c.setNewValue(hid(dto.newValueId));
+        c.setNewValue(hidOrCache(dto.newValueId));
         c.setUri(normalizeUri(dto.resourceUri));
         c.setIndex(dto.index);
         return c;
@@ -134,7 +134,7 @@ public class ChangeDtoDeserializer {
 
     private EChange<HierarchicalId> deserializeRemoveRoot(SemanticChangeLog.ChangeDto dto) {
         RemoveRootEObject<HierarchicalId> c = RootFactory.eINSTANCE.createRemoveRootEObject();
-        c.setOldValue(hid(dto.oldValueId));
+        c.setOldValue(hidOrCache(dto.oldValueId));
         c.setUri(normalizeUri(dto.resourceUri));
         c.setIndex(dto.index);
         return c;
@@ -146,21 +146,21 @@ public class ChangeDtoDeserializer {
     private EChange<HierarchicalId> deserializeInsertReference(SemanticChangeLog.ChangeDto dto) {
         EReference ref = resolveReference(dto.affectedEClassName, dto.featureName);
         return (EChange<HierarchicalId>) (EChange<?>) FACTORY.createInsertReferenceChange(
-                hid(dto.affectedElementId), ref, hid(dto.newValueId), dto.index);
+                hid(dto.affectedElementId), ref, hidOrCache(dto.newValueId), dto.index);
     }
 
     @SuppressWarnings("unchecked")
     private EChange<HierarchicalId> deserializeRemoveReference(SemanticChangeLog.ChangeDto dto) {
         EReference ref = resolveReference(dto.affectedEClassName, dto.featureName);
         return (EChange<HierarchicalId>) (EChange<?>) FACTORY.createRemoveReferenceChange(
-                hid(dto.affectedElementId), ref, hid(dto.oldValueId), dto.index);
+                hid(dto.affectedElementId), ref, hidOrCache(dto.oldValueId), dto.index);
     }
 
     @SuppressWarnings("unchecked")
     private EChange<HierarchicalId> deserializeReplaceReference(SemanticChangeLog.ChangeDto dto) {
         EReference ref = resolveReference(dto.affectedEClassName, dto.featureName);
         return (EChange<HierarchicalId>) (EChange<?>) FACTORY.createReplaceSingleReferenceChange(
-                hid(dto.affectedElementId), ref, hid(dto.oldValueId), hid(dto.newValueId));
+                hid(dto.affectedElementId), ref, hidOrCache(dto.oldValueId), hidOrCache(dto.newValueId));
     }
 
     // === Attribute changes ===
@@ -192,9 +192,21 @@ public class ChangeDtoDeserializer {
 
     // === Resolution helpers ===
 
+    /**
+     * Resolves an ID to a HierarchicalId using the normalized resource-based path.
+     * Used for affectedElement in feature/attribute changes (element is already in a resource).
+     */
     private HierarchicalId hid(String idString) {
         if (idString == null) return null;
-        // Check if this ID maps to a cache ID (for newly created elements)
+        return new HierarchicalId(normalizeId(idString));
+    }
+
+    /**
+     * Resolves an ID, returning cache ID if the element was just created.
+     * Used for newValue/oldValue in reference changes (element may still be in staging area).
+     */
+    private HierarchicalId hidOrCache(String idString) {
+        if (idString == null) return null;
         String cacheId = createdElementCacheIds.get(idString);
         if (cacheId != null) {
             return new HierarchicalId(cacheId);
