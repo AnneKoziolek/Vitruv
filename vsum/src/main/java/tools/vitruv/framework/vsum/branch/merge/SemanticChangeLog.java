@@ -250,7 +250,8 @@ public class SemanticChangeLog {
         }
 
         private static String idToString(HierarchicalId id) {
-            return id != null ? id.toString() : null;
+            // Use getId() not toString() to avoid the "Id(...)" wrapper
+            return id != null ? id.getId() : null;
         }
 
         @Override

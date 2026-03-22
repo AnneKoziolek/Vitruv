@@ -155,11 +155,11 @@ public class ChangeLogCapture implements ChangePropagationListener {
     private String extractHidFromChange(EChange<HierarchicalId> change) {
         if (change instanceof tools.vitruv.change.atomic.feature.FeatureEChange<HierarchicalId, ?> fc
                 && fc.getAffectedElement() != null) {
-            return fc.getAffectedElement().toString();
+            return fc.getAffectedElement().getId();
         }
         if (change instanceof tools.vitruv.change.atomic.eobject.EObjectExistenceEChange<HierarchicalId> ec
                 && ec.getAffectedElement() != null) {
-            return ec.getAffectedElement().toString();
+            return ec.getAffectedElement().getId();
         }
         return null;
     }
