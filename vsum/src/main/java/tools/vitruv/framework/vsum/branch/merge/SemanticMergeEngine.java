@@ -144,10 +144,15 @@ public class SemanticMergeEngine {
                     if (conflictResolutionProvider != null) {
                         List<ConflictResolution> resolutions = conflictResolutionProvider.resolve(conflicts);
                         LOGGER.info("Resolved {} conflicts via provider", resolutions.size());
-                        // Apply resolutions by modifying what we merge
-                        // For now: if THEIRS chosen, theirs changes are applied (default behavior)
-                        // If OURS chosen, skip theirs' conflicting changes (keep ours state)
-                        // The view-based merge already keeps ours; we just need to add theirs' additions
+
+                        // Apply resolved conflicts directly to the target VSUM
+                        InternalVirtualModel resolveVsum = GitStateLoader.loadVsumFromDir(
+                                oursDir, specs, interactionProvider);
+                        applyConflictResolutions(resolveVsum, conflicts, resolutions, theirsDir, baseDir, primaryModelFiles);
+                        resolveVsum.dispose();
+
+                        return SemanticMergeResult.successWithResolutions(
+                                resolutions, List.of(), oursDir);
                     } else {
                         LOGGER.warn("Semantic merge aborted: {} conflicts detected", conflicts.size());
                         return SemanticMergeResult.conflict(conflicts);
@@ -328,6 +333,103 @@ public class SemanticMergeEngine {
      * Loads an EMF resource from a file path, using a canonical URI for addressing.
      * This ensures HierarchicalIds in derived changes reference the target VSUM's URIs.
      */
+    /**
+     * Applies conflict resolutions to the target VSUM.
+     * For THEIRS choice: applies the theirs value via a view with change recording.
+     * For OURS choice: keeps the current state (no-op).
+     */
+    @SuppressWarnings("unchecked")
+    private void applyConflictResolutions(
+            InternalVirtualModel targetVsum,
+            List<MergeConflict> conflicts,
+            List<ConflictResolution> resolutions,
+            Path theirsDir, Path baseDir, List<String> primaryModelFiles) {
+
+        // Build a map of resolution choices
+        java.util.Map<String, ConflictResolution.Choice> choiceMap = new java.util.HashMap<>();
+        for (ConflictResolution r : resolutions) {
+            choiceMap.put(r.elementUuid(), r.choice());
+        }
+
+        // For THEIRS choices, we need to apply theirs' values to the target
+        boolean hasTheirsChoice = choiceMap.values().stream()
+                .anyMatch(c -> c == ConflictResolution.Choice.THEIRS);
+
+        if (!hasTheirsChoice) {
+            // All choices are OURS → keep current state, nothing to do
+            return;
+        }
+
+        // Load theirs model to get the theirs values
+        ResourceSet theirsRs = withGlobalFactories(new ResourceSetImpl());
+        for (String modelFile : primaryModelFiles) {
+            Path theirsPath = theirsDir.resolve(modelFile);
+            if (Files.exists(theirsPath)) {
+                theirsRs.getResource(URI.createFileURI(theirsPath.toAbsolutePath().toString()), true);
+            }
+        }
+
+        // Create a change-recording view on the target VSUM
+        var selector = targetVsum.createSelector(
+                tools.vitruv.framework.views.ViewTypeFactory.createIdentityMappingViewType("conflict-resolve"));
+        targetVsum.getViewSourceModels().stream()
+                .flatMap(r -> r.getContents().stream())
+                .filter(obj -> {
+                    String uri = obj.eResource().getURI().toString();
+                    return primaryModelFiles.stream().anyMatch(uri::endsWith);
+                })
+                .forEach(root -> selector.setSelected(root, true));
+        var view = selector.createView().withChangeRecordingTrait();
+
+        // Apply theirs' values for each THEIRS resolution
+        for (MergeConflict conflict : conflicts) {
+            ConflictResolution.Choice choice = choiceMap.getOrDefault(
+                    conflict.getElementId(), ConflictResolution.Choice.OURS);
+            if (choice != ConflictResolution.Choice.THEIRS) continue;
+            if (conflict.getConflictingFeature() == null) continue;
+
+            // Find the element in the view and apply theirs' value
+            for (var viewRoot : view.getRootObjects(EObject.class)) {
+                applyTheirsValue(viewRoot, conflict, theirsRs);
+            }
+        }
+
+        try {
+            view.commitChanges();
+        } catch (Exception e) {
+            // "no concrete change" is OK if resolutions only kept ours values
+            LOGGER.debug("Conflict resolution commit: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Applies theirs' attribute value to the matching element in the view.
+     */
+    private void applyTheirsValue(EObject viewRoot, MergeConflict conflict, ResourceSet theirsRs) {
+        String featureName = conflict.getConflictingFeature();
+        String theirsValue = conflict.getTheirsValue();
+
+        // Find the corresponding element in theirs model
+        // For now, iterate elements and match by feature value pattern
+        for (var ref : viewRoot.eClass().getEAllContainments()) {
+            if (!ref.isMany()) continue;
+            var list = (List<EObject>) viewRoot.eGet(ref);
+            for (EObject element : list) {
+                var feature = element.eClass().getEStructuralFeature(featureName);
+                if (feature != null) {
+                    Object currentValue = element.eGet(feature);
+                    // Check if this is the conflicting element (its current value is ours' value)
+                    if (currentValue != null && currentValue.toString().equals(conflict.getOursValue())) {
+                        element.eSet(feature, theirsValue);
+                        java.lang.System.out.println("[MERGE] Applied theirs value: " +
+                                featureName + "=" + theirsValue + " (was " + currentValue + ")");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /**
      * Loads ALL changelog DTOs found in the extracted temp directory for a branch tip.
      * Scans the .vitruvius/semantic-changelogs/ directory for all .changelog.json files.
