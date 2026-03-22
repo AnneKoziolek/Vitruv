@@ -152,17 +152,23 @@ Each DTO captures the **primary user changes** only — derived changes (from re
 ### Algorithm
 
 ```
-1. Find merge base (common ancestor) via JGit RevWalk
-2. Extract source-branch changes: read changelogs from base..theirs
-3. Extract target-branch changes: read changelogs from base..ours
-4. Detect conflicts: both branches modify same element → CONFLICT
-5. If no conflicts:
-   a. Clone target state into temp directory
-   b. Load fresh VSUM from target state
-   c. Replay source changes via propagateChange()
-      → reactions fire, correspondences maintained
-   d. Save merged state
-6. Return SemanticMergeResult (SUCCESS or CONFLICT)
+1. Extract base, ours, theirs model states via JGit TreeWalk into temp dirs
+2. Load changelog DTOs from extracted dirs (.vitruvius/semantic-changelogs/)
+3. UUID-based conflict detection on DTOs:
+   - Same UUID + same feature + different values → MODIFY_MODIFY conflict
+   - Delete on one branch + modify on other → DELETE_MODIFY conflict
+   - Independent additions (different UUIDs) → NOT a conflict
+4. If conflicts + no resolver → return CONFLICT
+   If conflicts + resolver → filter DTOs by ours/theirs choice
+5. Load target VSUM from ours state
+6. Create ChangeRecordingView on target VSUM
+7. Apply three-way diff (base vs theirs) onto view:
+   - New elements in theirs: deep-copy into view
+   - Modified attributes: apply theirs' values
+   - Deleted elements: remove from view
+8. view.commitChanges() records individual EMF operations → propagateChange()
+   → reactions fire → derived models regenerated
+9. Return SemanticMergeResult (SUCCESS, CONFLICT, or SUCCESS_WITH_RESOLUTIONS)
 ```
 
 ### Usage
@@ -247,8 +253,8 @@ cd /workspace/Vitruvius-Branching-Test && ./mvnw -pl vsum verify
 
 ## Known Limitations (Prototype)
 
-- **Replay from DTOs not yet implemented**: Changelogs are captured and persisted, but deserializing DTOs back into live `EChange<HierarchicalId>` objects for `propagateChange()` replay is the next step.
 - **Git merge driver not configured**: `SemanticMergeCommand` is invoked programmatically; `.gitattributes`/`.gitconfig` integration is deferred.
-- **No interactive conflict resolution**: Merge aborts on conflict, reports only.
 - **Capture requires re-registration after reload**: `ChangeLogCapture` must be re-created after `vsum.reload()` because UuidResolver changes.
 - **Concurrent insert conflicts not detected**: Only MODIFY_MODIFY and DELETE_MODIFY.
+- **Position-based element matching in additive merge**: New elements from theirs are identified by list index comparison (elements beyond base count). Works for appends but not reorders.
+- **Rename operations require `withChangeRecordingTrait()`**: State-based `withChangeDerivingTrait()` produces CreateEObject (new UUID) instead of ReplaceSingleValuedEAttribute (same UUID), preventing conflict detection.
