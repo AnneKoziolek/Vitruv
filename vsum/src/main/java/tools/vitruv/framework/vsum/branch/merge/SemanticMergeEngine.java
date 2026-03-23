@@ -141,8 +141,10 @@ public class SemanticMergeEngine {
 
         // 5. Load target VSUM from ours state
         InternalVirtualModel targetVsum = GitStateLoader.loadVsumFromDir(oursDir, specs, interactionProvider);
-        String theirsUriPrefix = theirsDir.toAbsolutePath().toString();
-        String oursUriPrefix = oursDir.toAbsolutePath().toString();
+        // Use EMF URI format for the target prefix (the deserializer extracts filename
+        // from source IDs and prepends this prefix)
+        String oursUriPrefix = org.eclipse.emf.common.util.URI.createFileURI(
+                oursDir.toAbsolutePath().toString()).toString();
 
         // 6. Replay each transaction separately (per-transaction restore/reactions)
         //    After each transaction:
@@ -166,7 +168,7 @@ public class SemanticMergeEngine {
 
                 // Fresh deserializer per transaction (resets cache ID counter)
                 ChangeDtoDeserializer deserializer =
-                        new ChangeDtoDeserializer(theirsUriPrefix, oursUriPrefix);
+                        new ChangeDtoDeserializer(null, oursUriPrefix);
                 List<EChange<HierarchicalId>> txnChanges = deserializer.deserializeAll(txnDtos);
                 if (txnChanges.isEmpty()) continue;
 
@@ -229,17 +231,19 @@ public class SemanticMergeEngine {
      * modifies the copy, and propagateChange modifies the VSUM.
      */
     /**
-     * Replays deserialized EChanges onto a target VSUM through a ChangeRecordingView,
-     * using Vitruv's own {@link tools.vitruv.change.atomic.hid.AtomicEChangeHierarchicalIdResolver}
-     * and {@link tools.vitruv.change.atomic.command.internal.ApplyEChangeSwitch} to
-     * resolve and apply each change.
+     * Replays deserialized EChanges onto a target VSUM through a ChangeRecordingView.
      *
-     * <p>This reuses the same resolution and application code that Vitruv uses internally
-     * (the same path as {@code ChangeDerivingView} and {@code DeltaBasedResource}).
-     * The ChangeRecordingView captures the resulting EMF notifications, and
-     * {@code view.commitChanges()} propagates them through the reaction engine,
-     * enabling transitive propagation across coupled models.
+     * <p>Changes are applied using EMF's reflective API (eSet, eGet, list.add) rather
+     * than ApplyEChangeSwitch (which uses EMF Commands via EditingDomain). Direct
+     * reflective calls trigger EMF notifications on the objects' adapters, which the
+     * ChangeRecordingView's ChangeRecorder captures. ApplyEChangeSwitch uses ad-hoc
+     * EditingDomains that bypass the ResourceSet-level adapters.
+     *
+     * <p>The ChangeRecordingView captures EMF notifications, and {@code view.commitChanges()}
+     * propagates them through the reaction engine, enabling transitive propagation
+     * across coupled models.
      */
+    @SuppressWarnings("unchecked")
     private void replayChanges(InternalVirtualModel targetVsum,
                                 List<EChange<HierarchicalId>> changes) {
 
@@ -251,19 +255,67 @@ public class SemanticMergeEngine {
                 .forEach(root -> selector.setSelected(root, true));
         var view = selector.createView().withChangeRecordingTrait();
 
-        // Use Vitruv's own AtomicEChangeHierarchicalIdResolver to resolve and apply
+        // Resolve HierarchicalIds using the view's ResourceSet
         ResourceSet viewRs = view.getRootObjects(EObject.class).iterator().next()
                 .eResource().getResourceSet();
-        var resolver = new tools.vitruv.change.atomic.hid.AtomicEChangeHierarchicalIdResolver(viewRs);
+        var idResolver = tools.vitruv.change.atomic.hid.internal.HierarchicalIdResolver.create(viewRs);
 
-        // resolveAndApplyForward: resolves HierarchicalId→EObject via HierarchicalIdResolver,
-        // then applies via ApplyEChangeSwitch.applyEChange() — the same code path Vitruv uses
+        // Apply each change using EMF reflective API (triggers notifications for ChangeRecorder)
         for (EChange<HierarchicalId> eChange : changes) {
-            resolver.resolveAndApplyForward(eChange);
+            applyChangeReflectively(eChange, idResolver);
         }
 
         // Commit: ChangeRecordingView captured EMF notifications → propagateChange → reactions fire
         view.commitChanges();
+    }
+
+    /**
+     * Applies a deserialized EChange to the view's model using EMF's reflective API.
+     * Direct calls to eSet/eGet/list.add trigger proper EMF notifications that the
+     * ChangeRecorder captures (unlike ApplyEChangeSwitch which uses EditingDomain Commands).
+     */
+    @SuppressWarnings("unchecked")
+    private void applyChangeReflectively(EChange<HierarchicalId> eChange,
+                                          tools.vitruv.change.atomic.hid.internal.HierarchicalIdResolver idResolver) {
+        if (eChange instanceof tools.vitruv.change.atomic.eobject.CreateEObject<HierarchicalId> ce) {
+            EObject created = EcoreUtil.create(ce.getAffectedEObjectType());
+            idResolver.getAndUpdateId(created);
+
+        } else if (eChange instanceof tools.vitruv.change.atomic.feature.reference.InsertEReference<HierarchicalId> ir) {
+            EObject container = idResolver.getEObject(ir.getAffectedElement());
+            EObject newElement = idResolver.getEObject(ir.getNewValue());
+            var list = (List<EObject>) container.eGet(ir.getAffectedFeature());
+            if (ir.getIndex() >= 0 && ir.getIndex() <= list.size()) {
+                list.add(ir.getIndex(), newElement);
+            } else {
+                list.add(newElement);
+            }
+
+        } else if (eChange instanceof tools.vitruv.change.atomic.feature.attribute.ReplaceSingleValuedEAttribute<HierarchicalId, ?> rsa) {
+            EObject element = idResolver.getEObject(rsa.getAffectedElement());
+            element.eSet(rsa.getAffectedFeature(), rsa.getNewValue());
+
+        } else if (eChange instanceof tools.vitruv.change.atomic.feature.reference.RemoveEReference<HierarchicalId> rr) {
+            EObject container = idResolver.getEObject(rr.getAffectedElement());
+            var list = (List<EObject>) container.eGet(rr.getAffectedFeature());
+            if (rr.getIndex() >= 0 && rr.getIndex() < list.size()) {
+                list.remove(rr.getIndex());
+            }
+
+        } else if (eChange instanceof tools.vitruv.change.atomic.eobject.DeleteEObject<HierarchicalId> de) {
+            EObject element = idResolver.getEObject(de.getAffectedElement());
+            EcoreUtil.remove(element);
+
+        } else if (eChange instanceof tools.vitruv.change.atomic.feature.attribute.InsertEAttributeValue<HierarchicalId, ?> ia) {
+            EObject element = idResolver.getEObject(ia.getAffectedElement());
+            var list = (List<Object>) element.eGet(ia.getAffectedFeature());
+            list.add(ia.getIndex(), ia.getNewValue());
+
+        } else if (eChange instanceof tools.vitruv.change.atomic.root.InsertRootEObject<HierarchicalId> iro) {
+            EObject newRoot = idResolver.getEObject(iro.getNewValue());
+            idResolver.getResource(org.eclipse.emf.common.util.URI.createURI(iro.getUri()))
+                    .getContents().add(iro.getIndex(), newRoot);
+        }
     }
 
     /**

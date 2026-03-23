@@ -215,21 +215,37 @@ public class ChangeDtoDeserializer {
     }
 
     /**
-     * Normalizes a HierarchicalId string by replacing the source URI prefix
-     * with the target URI prefix, so IDs captured on the source branch
-     * resolve against the target VSUM's resources.
+     * Normalizes a HierarchicalId string so it resolves against the target VSUM's resources.
+     * Extracts the model filename + fragment from the source ID and reconstructs with
+     * the target URI prefix, since the source IDs contain absolute paths from a
+     * different temp directory.
      */
     private String normalizeId(String id) {
-        if (sourceUriPrefix != null && targetUriPrefix != null && id.contains(sourceUriPrefix)) {
-            return id.replace(sourceUriPrefix, targetUriPrefix);
+        if (id == null || targetUriPrefix == null) return id;
+        if (!id.contains("file:")) return id; // only normalize file URIs, not cache IDs
+
+        // Split on # to separate resource URI from fragment
+        int hashIdx = id.indexOf('#');
+        String resourcePart = hashIdx >= 0 ? id.substring(0, hashIdx) : id;
+        String fragment = hashIdx >= 0 ? id.substring(hashIdx) : "";
+
+        // Extract just the filename from the resource URI
+        int lastSlash = resourcePart.lastIndexOf('/');
+        if (lastSlash >= 0) {
+            String fileName = resourcePart.substring(lastSlash + 1);
+            return targetUriPrefix + "/" + fileName + fragment;
         }
         return id;
     }
 
     private String normalizeUri(String uri) {
-        if (uri == null) return null;
-        if (sourceUriPrefix != null && targetUriPrefix != null && uri.contains(sourceUriPrefix)) {
-            return uri.replace(sourceUriPrefix, targetUriPrefix);
+        if (uri == null || targetUriPrefix == null) return uri;
+        if (!uri.contains("file:")) return uri;
+
+        int lastSlash = uri.lastIndexOf('/');
+        if (lastSlash >= 0) {
+            String fileName = uri.substring(lastSlash + 1);
+            return targetUriPrefix + "/" + fileName;
         }
         return uri;
     }

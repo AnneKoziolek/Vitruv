@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collection;
+import java.util.List;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -86,6 +87,9 @@ public class GitStateLoader {
             Path vsumFolder,
             Collection<ChangePropagationSpecification> specs,
             InteractionResultProvider interactionProvider) throws IOException {
+        // Fix models.models: rewrite URIs to reference the actual vsumFolder
+        fixModelsFile(vsumFolder);
+
         VirtualModelBuilder builder = new VirtualModelBuilder()
                 .withStorageFolder(vsumFolder)
                 .withUserInteractorForResultProvider(interactionProvider);
@@ -93,6 +97,100 @@ public class GitStateLoader {
             builder.withChangePropagationSpecifications(spec);
         }
         return builder.buildAndInitialize();
+    }
+
+    /**
+     * Fixes the vsum/models.models file to reference model files in the actual
+     * vsumFolder. The file may contain absolute URIs from a different temp directory
+     * (when extracted via JGit TreeWalk from a commit).
+     */
+    private static void fixModelsFile(Path vsumFolder) throws IOException {
+        Path modelsFile = vsumFolder.resolve("vsum/models.models");
+        if (!Files.exists(modelsFile)) return;
+
+        // Find actual model files in the folder
+        List<String> modelUris;
+        try (var stream = Files.walk(vsumFolder)) {
+            modelUris = stream
+                    .filter(Files::isRegularFile)
+                    .filter(f -> {
+                        String name = f.getFileName().toString();
+                        return name.endsWith(".model") || name.endsWith(".model2")
+                                || name.endsWith(".xmi");
+                    })
+                    .filter(f -> !f.toString().contains("vsum/"))
+                    .map(f -> org.eclipse.emf.common.util.URI.createFileURI(
+                            f.toAbsolutePath().toString()).toString())
+                    .toList();
+        }
+
+        // Rewrite the models.models file with correct URIs
+        Files.writeString(modelsFile, String.join(java.lang.System.lineSeparator(), modelUris)
+                + java.lang.System.lineSeparator());
+
+        LOGGER.info("Fixed models.models with {} model URIs in {}", modelUris.size(), vsumFolder);
+
+        // Also fix uuid.uuid: replace old directory paths with the new folder
+        Path uuidFile = vsumFolder.resolve("vsum/uuid.uuid");
+        if (Files.exists(uuidFile)) {
+            List<String> lines = Files.readAllLines(uuidFile);
+            List<String> fixedLines = new java.util.ArrayList<>();
+            String folderUri = org.eclipse.emf.common.util.URI.createFileURI(
+                    vsumFolder.toAbsolutePath().toString()).toString();
+            boolean changed = false;
+
+            for (String line : lines) {
+                if (line.isBlank()) continue;
+                // Format: uuid|hierarchicalId
+                // hierarchicalId may be: file:///old/path/example.model#/0
+                // Replace the directory part with the new folder
+                String fixed = line;
+                if (line.contains("|") && line.contains("file:")) {
+                    // Format: uuid|file:/old/path/filename.ext#/fragment/path
+                    String[] parts = line.split("\\|", 2);
+                    if (parts.length == 2) {
+                        String idPart = parts[1];
+                        // Split on # to separate resource URI from fragment
+                        int hashIdx = idPart.indexOf('#');
+                        String resourceUri = hashIdx >= 0 ? idPart.substring(0, hashIdx) : idPart;
+                        String fragment = hashIdx >= 0 ? idPart.substring(hashIdx) : "";
+                        // Extract just the filename from the resource URI
+                        int lastSlash = resourceUri.lastIndexOf('/');
+                        if (lastSlash >= 0) {
+                            String fileName = resourceUri.substring(lastSlash + 1);
+                            fixed = parts[0] + "|" + folderUri + "/" + fileName + fragment;
+                            changed = true;
+                        }
+                    }
+                }
+                fixedLines.add(fixed);
+            }
+
+            if (changed) {
+                Files.writeString(uuidFile,
+                        String.join(java.lang.System.lineSeparator(), fixedLines)
+                                + java.lang.System.lineSeparator());
+                LOGGER.info("Fixed {} uuid.uuid entries in {}", fixedLines.size(), vsumFolder);
+            }
+        }
+
+        // Also fix correspondences.correspondence (XMI file with hrefs)
+        Path corrFile = vsumFolder.resolve("vsum/correspondences.correspondence");
+        if (Files.exists(corrFile)) {
+            String content = Files.readString(corrFile);
+            // Replace old file URI paths with new folder paths
+            // hrefs look like: href="file:///old/path/example.model#/0"
+            String corrFolderUri = org.eclipse.emf.common.util.URI.createFileURI(
+                    vsumFolder.toAbsolutePath().toString()).toString();
+            // Replace old file URI paths with new folder, keeping filename + fragment
+            String fixed = content.replaceAll(
+                    "file:/+[^\"]*?/([^/\"]+)(#[^\"]*)?\"",
+                    corrFolderUri + "/$1$2\"");
+            if (!fixed.equals(content)) {
+                Files.writeString(corrFile, fixed);
+                LOGGER.info("Fixed correspondences.correspondence URIs in {}", vsumFolder);
+            }
+        }
     }
 
     /**
