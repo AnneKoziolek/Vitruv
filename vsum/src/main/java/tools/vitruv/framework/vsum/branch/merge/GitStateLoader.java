@@ -108,20 +108,20 @@ public class GitStateLoader {
         Path modelsFile = vsumFolder.resolve("vsum/models.models");
         if (!Files.exists(modelsFile)) return;
 
-        // Find actual model files in the folder
-        List<String> modelUris;
-        try (var stream = Files.walk(vsumFolder)) {
-            modelUris = stream
-                    .filter(Files::isRegularFile)
-                    .filter(f -> {
-                        String name = f.getFileName().toString();
-                        return name.endsWith(".model") || name.endsWith(".model2")
-                                || name.endsWith(".xmi");
-                    })
-                    .filter(f -> !f.toString().contains("vsum/"))
-                    .map(f -> org.eclipse.emf.common.util.URI.createFileURI(
-                            f.toAbsolutePath().toString()).toString())
-                    .toList();
+        // Read existing models.models to find which model files should be listed,
+        // then locate them in the actual folder. This handles any file extension
+        // (not just .model/.xmi) by extracting filenames from the old URIs.
+        List<String> oldLines = Files.readAllLines(modelsFile);
+        List<String> modelUris = new java.util.ArrayList<>();
+        for (String oldLine : oldLines) {
+            if (oldLine.isBlank()) continue;
+            // Extract just the filename from the old URI (e.g., "example.model" from "file:/.../example.model")
+            String fileName = oldLine.substring(oldLine.lastIndexOf('/') + 1);
+            Path modelFile = vsumFolder.resolve(fileName);
+            if (Files.exists(modelFile)) {
+                modelUris.add(org.eclipse.emf.common.util.URI.createFileURI(
+                        modelFile.toAbsolutePath().toString()).toString());
+            }
         }
 
         // Rewrite the models.models file with correct URIs

@@ -296,6 +296,13 @@ public class ChangeDtoDeserializer {
     private Object convertValue(Object raw, EAttribute attr) {
         if (raw == null) return null;
         EDataType type = attr.getEAttributeType();
-        return EcoreUtil.createFromString(type, raw.toString());
+        String stringValue = raw.toString();
+        // Gson deserializes all numbers as Double. Convert to int string if the target type is integer.
+        String typeName = type.getName();
+        if (raw instanceof Double d && ("EInt".equals(typeName) || "EIntegerObject".equals(typeName)
+                || "int".equals(typeName) || "Integer".equals(typeName))) {
+            stringValue = String.valueOf(d.intValue());
+        }
+        return EcoreUtil.createFromString(type, stringValue);
     }
 }
