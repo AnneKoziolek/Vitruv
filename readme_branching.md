@@ -47,10 +47,12 @@ branch/
     ├── ChangeDtoDeserializer.java  # Reconstruct EChange<HierarchicalId> from JSON DTOs
     ├── GitStateLoader.java         # Load VSUM state from a specific Git commit
     ├── UuidConflictDetector.java   # UUID-based conflict detection on changelog DTOs
-    ├── MergeConflict.java          # Conflict data class
-    ├── SemanticMergeResult.java    # Merge outcome data class
-    ├── SemanticMergeEngine.java    # Core three-way merge algorithm
-    └── SemanticMergeCommand.java   # CLI / programmatic entry point
+    ├── MergeConflict.java          # Conflict data class (6 conflict types)
+    ├── ConflictResolution.java     # User's OURS/THEIRS choice per conflict
+    ├── ConflictResolutionProvider.java  # Strategy for resolving conflicts
+    ├── SemanticMergeResult.java    # Merge outcome (status, direction, warnings)
+    ├── SemanticMergeEngine.java    # Core merge: directed + bidirectional
+    └── SemanticMergeCommand.java   # Entry point: execute() + executeBidirectional()
 ```
 
 ## How Branch Switching Works
@@ -149,7 +151,7 @@ Each DTO captures the **primary user changes** only — derived changes (from re
 
 ## How Semantic Three-Way Merge Works
 
-### Algorithm
+### Directed Merge Algorithm (A→B)
 
 ```
 1. Extract base, ours, theirs model states via JGit TreeWalk into temp dirs
@@ -160,27 +162,55 @@ Each DTO captures the **primary user changes** only — derived changes (from re
    - Independent additions (different UUIDs) → NOT a conflict
 4. If conflicts + no resolver → return CONFLICT
    If conflicts + resolver → filter DTOs by ours/theirs choice
-5. Deserialize filtered DTOs into live EChange<HierarchicalId> via ChangeDtoDeserializer
-6. Load target VSUM from ours state
-7. Replay on a copy ResourceSet (same pattern as IdentityMappingViewType.commitViewChanges):
-   a. Copy VSUM's model resources + UUID mappings into a fresh ResourceSet
-   b. resolveAndApply(changes) — resolves HierarchicalId→EObject on the copy
-   c. assignIds(resolved) — assigns UUIDs on the copy
-   d. propagateChange(uuidChange) — applies to the VSUM, fires reactions
-8. Return SemanticMergeResult (SUCCESS, CONFLICT, or SUCCESS_WITH_RESOLUTIONS)
+5. Load target VSUM from ours state
+6. Per-transaction replay:
+   For each transaction in theirs:
+   a. Check user(A) vs derived(B) warnings (before replay)
+   b. Snapshot user(B) footprint values (for indirect conflict detection)
+   c. Deserialize DTOs into live EChange<HierarchicalId> via ChangeDtoDeserializer
+   d. Replay via ChangeRecordingView → commitChanges() → reactions fire
+   e. Detect indirect conflicts: derived(replay(A)) vs user(B) (after replay)
+7. Return SemanticMergeResult (SUCCESS, CONFLICT, or SUCCESS_WITH_RESOLUTIONS)
+   with warnings for indirect conflicts and user-vs-derived overwrites
 ```
+
+### Bidirectional Merge Algorithm
+
+When replaying A→B, if derived(A) overwrites user(B) (indirect conflict), the model may be left inconsistent because the reaction's effect is discarded. The bidirectional merge addresses this:
+
+```
+1. Try forward merge: A→B (replay A onto B)
+2. If direct conflicts with no resolver → return CONFLICT
+3. If no indirect conflicts → forward is clean, return result (direction=FORWARD)
+4. If indirect conflicts detected → try reverse: B→A (replay B onto A)
+   - Invert conflict resolution provider (OURS↔THEIRS swapped)
+5. If reverse has no indirect conflicts → return reverse result (direction=REVERSED)
+6. If both directions have indirect conflicts → true BIDIRECTIONAL_INDIRECT_CONFLICT
+```
+
+Use `SemanticMergeCommand.executeBidirectional()` or `SemanticMergeEngine.mergeBidirectional()` to invoke this.
 
 ### Usage
 
 ```java
+// Directed merge (A→B):
 SemanticMergeCommand cmd = new SemanticMergeCommand();
 SemanticMergeResult result = cmd.execute(
     repoRoot, "feature-x", "main",
     List.of(new MyChangePropagationSpecification()),
     new TestUserInteraction.ResultProvider(new TestUserInteraction()));
 
+// Bidirectional merge (tries both directions on indirect conflict):
+SemanticMergeResult result = cmd.executeBidirectional(
+    repoRoot, "feature-x", "main",
+    List.of(new MyChangePropagationSpecification()),
+    new TestUserInteraction.ResultProvider(new TestUserInteraction()),
+    ConflictResolutionProvider.chooseAllTheirs()); // optional
+
 if (result.isSuccess()) {
     // Merged state is at result.getMergedStateFolder()
+    // Check which direction was used:
+    System.out.println("Direction: " + result.getMergeDirection()); // FORWARD or REVERSED
 } else {
     for (MergeConflict conflict : result.getConflicts()) {
         System.out.println("Conflict on element: " + conflict.getElementId());
@@ -188,13 +218,16 @@ if (result.isSuccess()) {
 }
 ```
 
-### Conflict Types
+### Conflict and Warning Types
 
-| Type | Description |
-|------|-------------|
-| `MODIFY_MODIFY` | Both branches modify the same element |
-| `DELETE_MODIFY` | Target deletes, source modifies |
-| `MODIFY_DELETE` | Target modifies, source deletes |
+| Type | Blocking? | Description |
+|------|-----------|-------------|
+| `MODIFY_MODIFY` | Yes | Both branches modify the same element+feature |
+| `DELETE_MODIFY` | Yes | Target deletes, source modifies |
+| `MODIFY_DELETE` | Yes | Target modifies, source deletes |
+| `INDIRECT_CONFLICT` | No (warning) | Derived(replay(A)) overwrites user(B) |
+| `USER_VS_DERIVED_WARNING` | No (warning) | User(A) overwrites derived state on B |
+| `BIDIRECTIONAL_INDIRECT_CONFLICT` | Yes | Both merge directions produce indirect conflicts |
 
 ## Git Hooks
 
