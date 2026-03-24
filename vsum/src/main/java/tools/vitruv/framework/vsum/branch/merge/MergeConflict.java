@@ -24,7 +24,9 @@ public class MergeConflict {
         /** Derived change from replay(A) overwrites user change on B — indirect conflict. */
         INDIRECT_CONFLICT,
         /** User change from A overwrites derived state on B — non-blocking warning. */
-        USER_VS_DERIVED_WARNING
+        USER_VS_DERIVED_WARNING,
+        /** Both merge directions produce indirect conflicts — true semantic conflict. */
+        BIDIRECTIONAL_INDIRECT_CONFLICT
     }
 
     private final String elementId;

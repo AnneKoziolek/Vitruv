@@ -81,4 +81,63 @@ public class SemanticMergeCommand {
         LOGGER.info("Semantic merge result: {}", result);
         return result;
     }
+
+    /**
+     * Executes a bidirectional semantic merge between two branches.
+     *
+     * <p>Unlike {@link #execute}, which performs a directed merge (source→target),
+     * this method tries both directions when indirect conflicts arise. If replaying
+     * A onto B produces indirect conflicts (derived(A) vs user(B)), the reverse
+     * direction B→A is attempted. If one direction is clean, that result is used.
+     * If both directions have indirect conflicts, the merge is reported as a true conflict.
+     *
+     * @param repoRoot      the Git repository root
+     * @param branchA       first branch name (symmetric — not source/target)
+     * @param branchB       second branch name (symmetric — not source/target)
+     * @param specs         the change propagation specifications
+     * @param interactionProvider user interaction provider for VSUM creation
+     * @param conflictResolutionProvider optional provider for resolving direct conflicts
+     * @return the merge result, with {@link SemanticMergeResult.MergeDirection} indicating
+     *         which direction was used
+     */
+    public SemanticMergeResult executeBidirectional(
+            Path repoRoot,
+            String branchA,
+            String branchB,
+            Collection<ChangePropagationSpecification> specs,
+            InteractionResultProvider interactionProvider,
+            ConflictResolutionProvider conflictResolutionProvider) throws Exception {
+
+        LOGGER.info("Bidirectional semantic merge: {} <-> {}", branchA, branchB);
+
+        String branchASha;
+        String branchBSha;
+        try (Git git = Git.open(repoRoot.toFile())) {
+            Ref refA = git.getRepository().findRef(branchA);
+            Ref refB = git.getRepository().findRef(branchB);
+
+            if (refA == null) {
+                throw new IOException("Cannot resolve branch: " + branchA);
+            }
+            if (refB == null) {
+                throw new IOException("Cannot resolve branch: " + branchB);
+            }
+
+            branchASha = refA.getObjectId().getName();
+            branchBSha = refB.getObjectId().getName();
+        }
+
+        GitStateLoader loader = new GitStateLoader(repoRoot);
+        String baseSha = loader.findMergeBase(branchASha, branchBSha);
+        if (baseSha == null) {
+            throw new IOException("No common ancestor between " + branchA + " and " + branchB);
+        }
+
+        SemanticMergeEngine engine = new SemanticMergeEngine(
+                repoRoot, specs, interactionProvider, conflictResolutionProvider);
+        SemanticMergeResult result = engine.mergeBidirectional(baseSha, branchASha, branchBSha);
+
+        LOGGER.info("Bidirectional merge result: {}", result);
+        return result;
+    }
 }

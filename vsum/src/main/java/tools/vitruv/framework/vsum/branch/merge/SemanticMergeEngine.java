@@ -80,6 +80,126 @@ public class SemanticMergeEngine {
         this.conflictResolutionProvider = conflictResolutionProvider;
     }
 
+    /**
+     * Performs a bidirectional merge between two branches.
+     *
+     * <p>First attempts A→B (replay A onto B). If indirect conflicts are detected
+     * (derived(A) vs user(B)), attempts the reverse direction B→A. If B→A is clean,
+     * uses that result. If both directions produce indirect conflicts, escalates to
+     * a true blocking conflict.
+     *
+     * <p>This avoids the inconsistency problem where discarding derived(A) in A→B
+     * leaves reactions unexecuted. In B→A, user(B)'s changes are replayed and
+     * reactions fire naturally.
+     *
+     * @param baseSha    common ancestor commit SHA
+     * @param branchASha commit SHA of branch A
+     * @param branchBSha commit SHA of branch B
+     * @return the merge result, with {@link SemanticMergeResult.MergeDirection} indicating
+     *         which direction was used
+     */
+    public SemanticMergeResult mergeBidirectional(String baseSha, String branchASha, String branchBSha)
+            throws IOException, GitAPIException {
+
+        LOGGER.info("Bidirectional merge: base={}, A={}, B={}",
+                baseSha.substring(0, 7), branchASha.substring(0, 7), branchBSha.substring(0, 7));
+
+        // 1. Try forward: replay A onto B (ours=B, theirs=A)
+        SemanticMergeResult forwardResult = merge(baseSha, branchBSha, branchASha);
+
+        // 2. If direct conflicts with no resolver, return immediately
+        if (!forwardResult.isSuccess()) {
+            return forwardResult;
+        }
+
+        // 3. Check for indirect conflicts in forward direction
+        List<MergeConflict> forwardIndirect = forwardResult.getWarnings().stream()
+                .filter(w -> w.getType() == MergeConflict.ConflictType.INDIRECT_CONFLICT)
+                .toList();
+
+        if (forwardIndirect.isEmpty()) {
+            LOGGER.info("Forward merge (A→B) clean — no indirect conflicts");
+            return forwardResult;
+        }
+
+        LOGGER.info("Forward merge (A→B) has {} indirect conflict(s) — attempting reverse (B→A)",
+                forwardIndirect.size());
+
+        // 4. Try reverse: replay B onto A (ours=A, theirs=B)
+        //    For the reverse direction, we need to invert the conflict resolution provider
+        //    because ours/theirs roles are swapped.
+        SemanticMergeEngine reverseEngine = new SemanticMergeEngine(
+                repoRoot, specs, interactionProvider,
+                invertResolutionProvider(conflictResolutionProvider));
+        SemanticMergeResult reverseResult = reverseEngine.merge(baseSha, branchASha, branchBSha);
+
+        // 5. If reverse had direct conflicts (no resolver), return forward result as-is
+        //    (direct conflicts are symmetric, so this shouldn't happen if forward succeeded)
+        if (!reverseResult.isSuccess()) {
+            LOGGER.warn("Reverse merge (B→A) failed with direct conflicts — returning forward result");
+            return forwardResult;
+        }
+
+        // 6. Check for indirect conflicts in reverse direction
+        List<MergeConflict> reverseIndirect = reverseResult.getWarnings().stream()
+                .filter(w -> w.getType() == MergeConflict.ConflictType.INDIRECT_CONFLICT)
+                .toList();
+
+        if (reverseIndirect.isEmpty()) {
+            LOGGER.info("Reverse merge (B→A) clean — using reversed result");
+            // Return reverse result annotated as REVERSED
+            List<MergeConflict> reverseWarnings = reverseResult.getWarnings();
+            if (!reverseResult.getAppliedResolutions().isEmpty()) {
+                return SemanticMergeResult.successWithResolutions(
+                        reverseResult.getAppliedResolutions(),
+                        reverseResult.getAppliedChanges(),
+                        reverseWarnings,
+                        reverseResult.getMergedStateFolder(),
+                        SemanticMergeResult.MergeDirection.REVERSED);
+            }
+            return SemanticMergeResult.success(
+                    reverseResult.getAppliedChanges(),
+                    reverseWarnings,
+                    reverseResult.getMergedStateFolder(),
+                    SemanticMergeResult.MergeDirection.REVERSED);
+        }
+
+        // 7. Both directions have indirect conflicts — true conflict
+        LOGGER.warn("Both directions have indirect conflicts — escalating to true conflict");
+        List<MergeConflict> bidirectionalConflicts = new ArrayList<>();
+        for (MergeConflict ic : forwardIndirect) {
+            bidirectionalConflicts.add(new MergeConflict(
+                    ic.getElementId(),
+                    MergeConflict.ConflictType.BIDIRECTIONAL_INDIRECT_CONFLICT,
+                    ic.getElementUuid(), ic.getConflictingFeature(),
+                    ic.getBaseValue(), ic.getOursValue(), ic.getTheirsValue()));
+        }
+        for (MergeConflict ic : reverseIndirect) {
+            bidirectionalConflicts.add(new MergeConflict(
+                    ic.getElementId(),
+                    MergeConflict.ConflictType.BIDIRECTIONAL_INDIRECT_CONFLICT,
+                    ic.getElementUuid(), ic.getConflictingFeature(),
+                    ic.getBaseValue(), ic.getOursValue(), ic.getTheirsValue()));
+        }
+        return SemanticMergeResult.conflict(bidirectionalConflicts);
+    }
+
+    /**
+     * Creates an inverting wrapper around a {@link ConflictResolutionProvider} that
+     * flips OURS↔THEIRS choices. Used for reverse-direction merges where the
+     * ours/theirs roles are swapped.
+     */
+    private static ConflictResolutionProvider invertResolutionProvider(
+            ConflictResolutionProvider provider) {
+        if (provider == null) return null;
+        return conflicts -> provider.resolve(conflicts).stream()
+                .map(r -> new ConflictResolution(r.elementUuid(),
+                        r.choice() == ConflictResolution.Choice.OURS
+                                ? ConflictResolution.Choice.THEIRS
+                                : ConflictResolution.Choice.OURS))
+                .toList();
+    }
+
     public SemanticMergeResult merge(String baseSha, String oursSha, String theirsSha)
             throws IOException, GitAPIException {
 

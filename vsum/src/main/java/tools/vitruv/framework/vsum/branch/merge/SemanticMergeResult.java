@@ -21,18 +21,27 @@ public class SemanticMergeResult {
         SUCCESS_WITH_RESOLUTIONS
     }
 
+    public enum MergeDirection {
+        /** A→B: source replayed onto target (default). */
+        FORWARD,
+        /** B→A: reverse replay was used because forward had indirect conflicts. */
+        REVERSED
+    }
+
     private final Status status;
     private final List<MergeConflict> conflicts;
     private final List<EChange<HierarchicalId>> appliedChanges;
     private final List<ConflictResolution> appliedResolutions;
     private final List<MergeConflict> warnings;
     private final Path mergedStateFolder;
+    private final MergeDirection mergeDirection;
 
     private SemanticMergeResult(Status status, List<MergeConflict> conflicts,
                                 List<EChange<HierarchicalId>> appliedChanges,
                                 List<ConflictResolution> appliedResolutions,
                                 List<MergeConflict> warnings,
-                                Path mergedStateFolder) {
+                                Path mergedStateFolder,
+                                MergeDirection mergeDirection) {
         this.status = status;
         this.conflicts = Collections.unmodifiableList(List.copyOf(conflicts));
         this.appliedChanges = Collections.unmodifiableList(List.copyOf(appliedChanges));
@@ -41,6 +50,16 @@ public class SemanticMergeResult {
         this.warnings = warnings != null
                 ? Collections.unmodifiableList(List.copyOf(warnings)) : List.of();
         this.mergedStateFolder = mergedStateFolder;
+        this.mergeDirection = mergeDirection != null ? mergeDirection : MergeDirection.FORWARD;
+    }
+
+    private SemanticMergeResult(Status status, List<MergeConflict> conflicts,
+                                List<EChange<HierarchicalId>> appliedChanges,
+                                List<ConflictResolution> appliedResolutions,
+                                List<MergeConflict> warnings,
+                                Path mergedStateFolder) {
+        this(status, conflicts, appliedChanges, appliedResolutions, warnings,
+                mergedStateFolder, MergeDirection.FORWARD);
     }
 
     public static SemanticMergeResult success(List<EChange<HierarchicalId>> appliedChanges,
@@ -75,6 +94,26 @@ public class SemanticMergeResult {
                 appliedChanges, resolutions, warnings, mergedStateFolder);
     }
 
+    /** Creates a success result with a specific merge direction. */
+    public static SemanticMergeResult success(List<EChange<HierarchicalId>> appliedChanges,
+                                               List<MergeConflict> warnings,
+                                               Path mergedStateFolder,
+                                               MergeDirection direction) {
+        return new SemanticMergeResult(Status.SUCCESS, List.of(), appliedChanges, null, warnings,
+                mergedStateFolder, direction);
+    }
+
+    /** Creates a success-with-resolutions result with a specific merge direction. */
+    public static SemanticMergeResult successWithResolutions(
+            List<ConflictResolution> resolutions,
+            List<EChange<HierarchicalId>> appliedChanges,
+            List<MergeConflict> warnings,
+            Path mergedStateFolder,
+            MergeDirection direction) {
+        return new SemanticMergeResult(Status.SUCCESS_WITH_RESOLUTIONS, List.of(),
+                appliedChanges, resolutions, warnings, mergedStateFolder, direction);
+    }
+
     public Status getStatus() { return status; }
 
     public boolean isSuccess() {
@@ -87,14 +126,19 @@ public class SemanticMergeResult {
     /** Non-blocking warnings (e.g., user(A) vs derived(B)). */
     public List<MergeConflict> getWarnings() { return warnings; }
     public Path getMergedStateFolder() { return mergedStateFolder; }
+    /** The merge direction used (FORWARD or REVERSED). */
+    public MergeDirection getMergeDirection() { return mergeDirection; }
 
     @Override
     public String toString() {
+        String dirSuffix = mergeDirection == MergeDirection.REVERSED ? ", direction=REVERSED" : "";
         return switch (status) {
-            case SUCCESS -> "SemanticMergeResult{SUCCESS, %d changes applied}".formatted(appliedChanges.size());
-            case CONFLICT -> "SemanticMergeResult{CONFLICT, %d conflicts}".formatted(conflicts.size());
-            case SUCCESS_WITH_RESOLUTIONS -> "SemanticMergeResult{SUCCESS_WITH_RESOLUTIONS, %d resolutions}"
-                    .formatted(appliedResolutions.size());
+            case SUCCESS -> "SemanticMergeResult{SUCCESS, %d changes applied%s}"
+                    .formatted(appliedChanges.size(), dirSuffix);
+            case CONFLICT -> "SemanticMergeResult{CONFLICT, %d conflicts%s}"
+                    .formatted(conflicts.size(), dirSuffix);
+            case SUCCESS_WITH_RESOLUTIONS -> "SemanticMergeResult{SUCCESS_WITH_RESOLUTIONS, %d resolutions%s}"
+                    .formatted(appliedResolutions.size(), dirSuffix);
         };
     }
 }
