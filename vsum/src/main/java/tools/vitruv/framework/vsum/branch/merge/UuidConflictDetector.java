@@ -39,6 +39,10 @@ public class UuidConflictDetector {
      * @return list of conflicts (empty if none)
      */
     public List<MergeConflict> detectConflicts(List<ChangeDto> oursDtos, List<ChangeDto> theirsDtos) {
+        System.out.println("[CONFLICT DETECTION] UUID-based conflict detection starting...");
+        System.out.println("  Ours modifications: " + oursDtos.size() + " DTOs");
+        System.out.println("  Theirs modifications: " + theirsDtos.size() + " DTOs");
+
         // Group modifications by UUID+feature (only ReplaceSingleValued changes can conflict)
         Map<String, ChangeDto> oursModifications = extractModifications(oursDtos);
         Map<String, ChangeDto> theirsModifications = extractModifications(theirsDtos);
@@ -100,8 +104,10 @@ public class UuidConflictDetector {
 
         if (conflicts.isEmpty()) {
             LOGGER.debug("No UUID-based conflicts detected");
+            System.out.println("[CONFLICT DETECTION] Result: no direct conflicts");
         } else {
             LOGGER.info("Detected {} UUID-based conflicts", conflicts.size());
+            System.out.println("[CONFLICT DETECTION] Result: " + conflicts.size() + " direct conflict(s) found");
         }
 
         return conflicts;

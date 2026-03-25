@@ -104,11 +104,21 @@ public class SemanticMergeEngine {
         LOGGER.info("Bidirectional merge: base={}, A={}, B={}",
                 baseSha.substring(0, 7), branchASha.substring(0, 7), branchBSha.substring(0, 7));
 
+        System.out.println();
+        System.out.println("════════════════════════════════════════════════════════════════");
+        System.out.println("  MERGE TRACE: Bidirectional merge");
+        System.out.println("  Base: " + baseSha.substring(0, 7)
+                + "  |  Branch A: " + branchASha.substring(0, 7)
+                + "  |  Branch B: " + branchBSha.substring(0, 7));
+        System.out.println("════════════════════════════════════════════════════════════════");
+
         // 1. Try forward: replay A onto B (ours=B, theirs=A)
+        System.out.println("[BIDIR] Step 1: Attempting forward merge (A→B)...");
         SemanticMergeResult forwardResult = merge(baseSha, branchBSha, branchASha);
 
         // 2. If direct conflicts with no resolver, return immediately
         if (!forwardResult.isSuccess()) {
+            System.out.println("[BIDIR] Forward merge (A→B) failed with direct conflicts — aborting");
             return forwardResult;
         }
 
@@ -119,11 +129,15 @@ public class SemanticMergeEngine {
 
         if (forwardIndirect.isEmpty()) {
             LOGGER.info("Forward merge (A→B) clean — no indirect conflicts");
+            System.out.println("[BIDIR] Forward merge (A→B) clean — no indirect conflicts");
+            System.out.println("[BIDIR] Using forward result");
             return forwardResult;
         }
 
         LOGGER.info("Forward merge (A→B) has {} indirect conflict(s) — attempting reverse (B→A)",
                 forwardIndirect.size());
+        System.out.println("[BIDIR] Forward merge (A→B) has " + forwardIndirect.size()
+                + " indirect conflict(s) — attempting reverse (B→A)");
 
         // 4. Try reverse: replay B onto A (ours=A, theirs=B)
         //    For the reverse direction, we need to invert the conflict resolution provider
@@ -147,6 +161,7 @@ public class SemanticMergeEngine {
 
         if (reverseIndirect.isEmpty()) {
             LOGGER.info("Reverse merge (B→A) clean — using reversed result");
+            System.out.println("[BIDIR] Reverse merge (B→A) clean — using REVERSED result");
             // Return reverse result annotated as REVERSED
             List<MergeConflict> reverseWarnings = reverseResult.getWarnings();
             if (!reverseResult.getAppliedResolutions().isEmpty()) {
@@ -166,6 +181,7 @@ public class SemanticMergeEngine {
 
         // 7. Both directions have indirect conflicts — true conflict
         LOGGER.warn("Both directions have indirect conflicts — escalating to true conflict");
+        System.out.println("[BIDIR] Both directions have indirect conflicts → BIDIRECTIONAL_INDIRECT_CONFLICT");
         List<MergeConflict> bidirectionalConflicts = new ArrayList<>();
         for (MergeConflict ic : forwardIndirect) {
             bidirectionalConflicts.add(new MergeConflict(
@@ -206,6 +222,14 @@ public class SemanticMergeEngine {
         LOGGER.info("Semantic merge: base={}, ours={}, theirs={}",
                 baseSha.substring(0, 7), oursSha.substring(0, 7), theirsSha.substring(0, 7));
 
+        System.out.println();
+        System.out.println("════════════════════════════════════════════════════════════════");
+        System.out.println("  MERGE TRACE: Directed merge (replay theirs → ours)");
+        System.out.println("  Base: " + baseSha.substring(0, 7)
+                + "  |  Ours (target): " + oursSha.substring(0, 7)
+                + "  |  Theirs (source): " + theirsSha.substring(0, 7));
+        System.out.println("════════════════════════════════════════════════════════════════");
+
         long mergeStartNanos = System.nanoTime();
 
         GitStateLoader loader = new GitStateLoader(repoRoot);
@@ -227,9 +251,24 @@ public class SemanticMergeEngine {
         List<SemanticChangeLog.ChangeDto> theirsDtos = loadAllDtosFromDir(theirsDir);
         LOGGER.info("Loaded {} ours DTOs, {} theirs DTOs", oursDtos.size(), theirsDtos.size());
         LOGGER.info("[TIMING] DTO loading: {} ms", (System.nanoTime() - phaseStart) / 1_000_000);
+        System.out.println("[LOAD] Loaded " + oursDtos.size() + " ours (target) changelog DTOs, "
+                + theirsDtos.size() + " theirs (source) changelog DTOs");
+        if (!oursDtos.isEmpty()) {
+            System.out.println("[LOAD] Ours (target branch) changes:");
+            for (var dto : oursDtos) {
+                System.out.println("         " + formatChangeDto(dto));
+            }
+        }
+        if (!theirsDtos.isEmpty()) {
+            System.out.println("[LOAD] Theirs (source branch) changes:");
+            for (var dto : theirsDtos) {
+                System.out.println("         " + formatChangeDto(dto));
+            }
+        }
 
         if (theirsDtos.isEmpty()) {
             LOGGER.info("No theirs changelog DTOs — nothing to replay");
+            System.out.println("[RESULT] No source changes to replay — merge trivially succeeds");
             return SemanticMergeResult.success(List.of(), oursDir);
         }
 
@@ -242,13 +281,29 @@ public class SemanticMergeEngine {
             UuidConflictDetector detector = new UuidConflictDetector();
             conflicts = detector.detectConflicts(oursDtos, theirsDtos);
 
+            if (conflicts.isEmpty()) {
+                System.out.println("[CONFLICT] No direct UUID-based conflicts detected");
+            } else {
+                System.out.println("[CONFLICT] Detected " + conflicts.size() + " direct UUID-based conflict(s):");
+                for (var c : conflicts) {
+                    System.out.println("           " + formatConflict(c));
+                }
+            }
+
             if (!conflicts.isEmpty()) {
                 if (conflictResolutionProvider == null) {
                     LOGGER.warn("Merge aborted: {} conflicts", conflicts.size());
+                    System.out.println();
+                    System.out.println("════════════════════════════════════════════════════════════════");
+                    System.out.println("  MERGE RESULT: CONFLICT (" + conflicts.size()
+                            + " blocking conflict(s), merge aborted)");
+                    System.out.println("════════════════════════════════════════════════════════════════");
                     return SemanticMergeResult.conflict(conflicts);
                 }
                 resolutions = conflictResolutionProvider.resolve(conflicts);
                 theirsDtos = filterByResolutions(theirsDtos, conflicts, resolutions);
+                System.out.println("[CONFLICT] Conflicts resolved — " + theirsDtos.size()
+                        + " DTOs remaining to replay");
                 LOGGER.info("After conflict resolution: {} DTOs to replay", theirsDtos.size());
             }
         }
@@ -286,10 +341,17 @@ public class SemanticMergeEngine {
         // Collect user-authored footprints from target branch for conflict/warning checks
         Set<String> oursUserFootprints = collectUuidFootprints(oursDtos);
 
+        System.out.println("[REPLAY] Starting per-transaction replay ("
+                + theirsTransactions.size() + " transaction(s))");
         long replayPhaseStart = System.nanoTime();
         try {
             for (int i = 0; i < theirsTransactions.size(); i++) {
                 List<SemanticChangeLog.ChangeDto> txnDtos = theirsTransactions.get(i);
+                System.out.println("[REPLAY] ── Transaction " + (i + 1) + "/"
+                        + theirsTransactions.size() + " (" + txnDtos.size() + " change(s)) ──");
+                for (var dto : txnDtos) {
+                    System.out.println("           replay: " + formatChangeDto(dto));
+                }
 
                 // Build UUID-string → EObject map from the VSUM's model elements.
                 // Used for element existence checks and value snapshots.
@@ -299,8 +361,17 @@ public class SemanticMergeEngine {
                 // If this transaction's user changes target elements whose state on B
                 // is derived (not in oursDtos), that's a warning.
                 // Uses the loaded VSUM to check element existence (not just changelogs).
+                int warningsBefore = warnings.size();
                 warnings.addAll(detectUserVsDerivedWarnings(
                         txnDtos, oursUserFootprints, uuidToElement));
+                int newWarnings = warnings.size() - warningsBefore;
+                if (newWarnings > 0) {
+                    System.out.println("           [WARNING] " + newWarnings
+                            + " USER_VS_DERIVED_WARNING(s) detected before replay:");
+                    for (int w = warningsBefore; w < warnings.size(); w++) {
+                        System.out.println("             → " + formatConflict(warnings.get(w)));
+                    }
+                }
 
                 // Snapshot user(B) footprint values BEFORE replay for indirect conflict detection.
                 // After replay, any footprint whose value changed was overwritten by derived(A).
@@ -337,6 +408,7 @@ public class SemanticMergeEngine {
                         postReplayMap));
 
                 // Deduplicate by footprint
+                int indirectBefore = indirectConflicts.size();
                 Set<String> seen = new HashSet<>();
                 for (MergeConflict ic : txnIndirect) {
                     String key = ic.getElementUuid() + "#" + ic.getConflictingFeature();
@@ -344,6 +416,18 @@ public class SemanticMergeEngine {
                         indirectConflicts.add(ic);
                     }
                 }
+                int newIndirect = indirectConflicts.size() - indirectBefore;
+                if (newIndirect > 0) {
+                    System.out.println("           [INDIRECT] " + newIndirect
+                            + " INDIRECT_CONFLICT(s) detected after replay:");
+                    for (int ic = indirectBefore; ic < indirectConflicts.size(); ic++) {
+                        System.out.println("             → " + formatConflict(indirectConflicts.get(ic)));
+                    }
+                }
+                System.out.println("           [REPLAY] Transaction " + (i + 1) + " complete — "
+                        + txnChanges.size() + " changes applied, "
+                        + newIndirect + " indirect conflict(s), "
+                        + newWarnings + " warning(s)");
 
                 LOGGER.info("Replayed transaction {}/{} ({} changes, {} indirect conflicts, {} warnings)",
                         i + 1, theirsTransactions.size(), txnChanges.size(),
@@ -373,7 +457,27 @@ public class SemanticMergeEngine {
         List<MergeConflict> allWarnings = new ArrayList<>(warnings);
         allWarnings.addAll(indirectConflicts);
 
-        LOGGER.info("[TIMING] Total merge: {} ms", (System.nanoTime() - mergeStartNanos) / 1_000_000);
+        long totalMs = (System.nanoTime() - mergeStartNanos) / 1_000_000;
+        LOGGER.info("[TIMING] Total merge: {} ms", totalMs);
+
+        // Print final result summary
+        System.out.println();
+        System.out.println("════════════════════════════════════════════════════════════════");
+        String statusStr = resolutions.isEmpty() ? "SUCCESS" : "SUCCESS_WITH_RESOLUTIONS";
+        System.out.println("  MERGE RESULT: " + statusStr);
+        System.out.println("    Changes applied: " + allApplied.size());
+        System.out.println("    Warnings: " + allWarnings.size());
+        if (!allWarnings.isEmpty()) {
+            for (var w : allWarnings) {
+                System.out.println("      - " + formatConflict(w));
+            }
+        }
+        System.out.println("    Conflicts: 0 (blocking)");
+        if (!resolutions.isEmpty()) {
+            System.out.println("    Resolutions applied: " + resolutions.size());
+        }
+        System.out.println("    Duration: " + totalMs + " ms");
+        System.out.println("════════════════════════════════════════════════════════════════");
 
         if (!resolutions.isEmpty()) {
             return SemanticMergeResult.successWithResolutions(
@@ -765,6 +869,88 @@ public class SemanticMergeEngine {
             }
         }
         return conflicts;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Trace formatting helpers
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * Formats a ChangeDto into a human-readable description for trace output.
+     */
+    static String formatChangeDto(SemanticChangeLog.ChangeDto dto) {
+        String elementDesc = dto.affectedEClassName != null ? dto.affectedEClassName : "?";
+        String idShort = dto.affectedElementId != null ? shortenId(dto.affectedElementId) : "";
+
+        return switch (dto.changeType) {
+            case "CreateEObject" -> "create " + (dto.affectedEObjectType != null ? dto.affectedEObjectType : elementDesc);
+            case "DeleteEObject" -> "delete " + elementDesc + "(" + idShort + ")";
+            case "InsertRootEObject" -> "insert root " + (dto.newValueId != null ? shortenId(dto.newValueId) : "")
+                    + " into " + shortenUri(dto.resourceUri);
+            case "RemoveRootEObject" -> "remove root " + (dto.oldValueId != null ? shortenId(dto.oldValueId) : "")
+                    + " from " + shortenUri(dto.resourceUri);
+            case "InsertEReference" -> "add " + (dto.newValueId != null ? shortenId(dto.newValueId) : "element")
+                    + " to " + elementDesc + "(" + idShort + ")." + dto.featureName
+                    + " at index " + dto.index;
+            case "RemoveEReference" -> "remove " + (dto.oldValueId != null ? shortenId(dto.oldValueId) : "element")
+                    + " from " + elementDesc + "(" + idShort + ")." + dto.featureName;
+            case "ReplaceSingleValuedEReference" -> "set reference " + elementDesc + "(" + idShort + ")."
+                    + dto.featureName + " → " + (dto.newValueId != null ? shortenId(dto.newValueId) : "null");
+            case "ReplaceSingleValuedEAttribute" -> "modify " + elementDesc + "(" + idShort + ")."
+                    + dto.featureName + ": " + dto.oldLiteralValue + " → " + dto.newLiteralValue;
+            case "InsertEAttributeValue" -> "insert attribute value " + dto.newLiteralValue
+                    + " into " + elementDesc + "(" + idShort + ")." + dto.featureName;
+            case "RemoveEAttributeValue" -> "remove attribute value " + dto.oldLiteralValue
+                    + " from " + elementDesc + "(" + idShort + ")." + dto.featureName;
+            default -> dto.changeType + " on " + elementDesc + "(" + idShort + ")";
+        };
+    }
+
+    /**
+     * Formats a MergeConflict into a human-readable description for trace output.
+     */
+    static String formatConflict(MergeConflict conflict) {
+        return switch (conflict.getType()) {
+            case MODIFY_MODIFY -> "MODIFY_MODIFY on feature '" + conflict.getConflictingFeature()
+                    + "': ours=" + conflict.getOursValue() + ", theirs=" + conflict.getTheirsValue()
+                    + (conflict.getBaseValue() != null ? " (base=" + conflict.getBaseValue() + ")" : "");
+            case DELETE_MODIFY -> "DELETE_MODIFY: element deleted on one branch, modified on other"
+                    + (conflict.getElementUuid() != null ? " [uuid=" + shortenUuid(conflict.getElementUuid()) + "]" : "");
+            case MODIFY_DELETE -> "MODIFY_DELETE: element modified on one branch, deleted on other"
+                    + (conflict.getElementUuid() != null ? " [uuid=" + shortenUuid(conflict.getElementUuid()) + "]" : "");
+            case INDIRECT_CONFLICT -> "INDIRECT_CONFLICT: derived change overwrites user change on feature '"
+                    + conflict.getConflictingFeature() + "'"
+                    + (conflict.getOursValue() != null ? " (was: " + conflict.getOursValue()
+                            + " → became: " + conflict.getTheirsValue() + ")" : "");
+            case USER_VS_DERIVED_WARNING -> "USER_VS_DERIVED_WARNING: user(source) overwrites derived(target) on feature '"
+                    + conflict.getConflictingFeature() + "'"
+                    + (conflict.getTheirsValue() != null ? " → " + conflict.getTheirsValue() : "");
+            case BIDIRECTIONAL_INDIRECT_CONFLICT -> "BIDIRECTIONAL_INDIRECT_CONFLICT on feature '"
+                    + conflict.getConflictingFeature() + "': both directions have indirect conflicts";
+        };
+    }
+
+    private static String shortenId(String id) {
+        if (id == null) return "";
+        // Extract just the fragment part (after #) or the last path segment
+        int hash = id.indexOf('#');
+        if (hash >= 0) return id.substring(hash);
+        int lastSlash = id.lastIndexOf('/');
+        if (lastSlash >= 0 && lastSlash < id.length() - 1) return id.substring(lastSlash);
+        return id;
+    }
+
+    private static String shortenUri(String uri) {
+        if (uri == null) return "";
+        int lastSlash = uri.lastIndexOf('/');
+        if (lastSlash >= 0 && lastSlash < uri.length() - 1) return uri.substring(lastSlash + 1);
+        return uri;
+    }
+
+    private static String shortenUuid(String uuid) {
+        if (uuid == null) return "";
+        if (uuid.length() > 20) return uuid.substring(0, 20) + "...";
+        return uuid;
     }
 
     /**
