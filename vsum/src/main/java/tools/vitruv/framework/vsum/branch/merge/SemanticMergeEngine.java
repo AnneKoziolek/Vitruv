@@ -206,9 +206,12 @@ public class SemanticMergeEngine {
         LOGGER.info("Semantic merge: base={}, ours={}, theirs={}",
                 baseSha.substring(0, 7), oursSha.substring(0, 7), theirsSha.substring(0, 7));
 
+        long mergeStartNanos = System.nanoTime();
+
         GitStateLoader loader = new GitStateLoader(repoRoot);
 
         // 1. Extract states via JGit TreeWalk
+        long phaseStart = System.nanoTime();
         Path baseDir = GitStateLoader.createTempDir("merge-base-");
         Path theirsDir = GitStateLoader.createTempDir("merge-theirs-");
         Path oursDir = GitStateLoader.createTempDir("merge-ours-");
@@ -216,11 +219,14 @@ public class SemanticMergeEngine {
         loader.checkoutStateAtCommit(baseSha, baseDir);
         loader.checkoutStateAtCommit(theirsSha, theirsDir);
         loader.checkoutStateAtCommit(oursSha, oursDir);
+        LOGGER.info("[TIMING] Git state extraction: {} ms", (System.nanoTime() - phaseStart) / 1_000_000);
 
         // 2. Load changelog DTOs
+        phaseStart = System.nanoTime();
         List<SemanticChangeLog.ChangeDto> oursDtos = loadAllDtosFromDir(oursDir);
         List<SemanticChangeLog.ChangeDto> theirsDtos = loadAllDtosFromDir(theirsDir);
         LOGGER.info("Loaded {} ours DTOs, {} theirs DTOs", oursDtos.size(), theirsDtos.size());
+        LOGGER.info("[TIMING] DTO loading: {} ms", (System.nanoTime() - phaseStart) / 1_000_000);
 
         if (theirsDtos.isEmpty()) {
             LOGGER.info("No theirs changelog DTOs — nothing to replay");
@@ -228,6 +234,7 @@ public class SemanticMergeEngine {
         }
 
         // 3. UUID-based conflict detection
+        phaseStart = System.nanoTime();
         List<MergeConflict> conflicts = List.of();
         List<ConflictResolution> resolutions = List.of();
 
@@ -245,6 +252,8 @@ public class SemanticMergeEngine {
                 LOGGER.info("After conflict resolution: {} DTOs to replay", theirsDtos.size());
             }
         }
+
+        LOGGER.info("[TIMING] Conflict detection: {} ms", (System.nanoTime() - phaseStart) / 1_000_000);
 
         // 4. Load changelog DTOs grouped by transaction for per-transaction replay
         List<List<SemanticChangeLog.ChangeDto>> theirsTransactions =
@@ -277,6 +286,7 @@ public class SemanticMergeEngine {
         // Collect user-authored footprints from target branch for conflict/warning checks
         Set<String> oursUserFootprints = collectUuidFootprints(oursDtos);
 
+        long replayPhaseStart = System.nanoTime();
         try {
             for (int i = 0; i < theirsTransactions.size(); i++) {
                 List<SemanticChangeLog.ChangeDto> txnDtos = theirsTransactions.get(i);
@@ -344,6 +354,8 @@ public class SemanticMergeEngine {
             targetVsum.dispose();
             throw new IOException("Semantic merge replay failed", e);
         }
+        LOGGER.info("[TIMING] Replay phase (all transactions): {} ms",
+                (System.nanoTime() - replayPhaseStart) / 1_000_000);
 
         targetVsum.dispose();
 
@@ -360,6 +372,9 @@ public class SemanticMergeEngine {
         // because the merge direction (A→B) means A's changes take precedence.
         List<MergeConflict> allWarnings = new ArrayList<>(warnings);
         allWarnings.addAll(indirectConflicts);
+
+        LOGGER.info("[TIMING] Total merge: {} ms", (System.nanoTime() - mergeStartNanos) / 1_000_000);
+
         if (!resolutions.isEmpty()) {
             return SemanticMergeResult.successWithResolutions(
                     resolutions, allApplied, allWarnings, oursDir);
