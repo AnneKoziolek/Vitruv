@@ -28,6 +28,45 @@ public class SemanticMergeResult {
         REVERSED
     }
 
+    /**
+     * Per-phase timing statistics captured during the merge operation.
+     * All durations are in nanoseconds.
+     */
+    public static class TimingStats {
+        private long gitStateExtractionNanos;
+        private long dtoLoadingNanos;
+        private long conflictDetectionNanos;
+        private long replayNanos;
+        private long totalNanos;
+
+        public TimingStats() {}
+
+        public TimingStats gitStateExtraction(long nanos) { this.gitStateExtractionNanos = nanos; return this; }
+        public TimingStats dtoLoading(long nanos) { this.dtoLoadingNanos = nanos; return this; }
+        public TimingStats conflictDetection(long nanos) { this.conflictDetectionNanos = nanos; return this; }
+        public TimingStats replay(long nanos) { this.replayNanos = nanos; return this; }
+        public TimingStats total(long nanos) { this.totalNanos = nanos; return this; }
+
+        public long getGitStateExtractionNanos() { return gitStateExtractionNanos; }
+        public long getDtoLoadingNanos() { return dtoLoadingNanos; }
+        public long getConflictDetectionNanos() { return conflictDetectionNanos; }
+        public long getReplayNanos() { return replayNanos; }
+        public long getTotalNanos() { return totalNanos; }
+
+        public double getGitStateExtractionMs() { return gitStateExtractionNanos / 1_000_000.0; }
+        public double getDtoLoadingMs() { return dtoLoadingNanos / 1_000_000.0; }
+        public double getConflictDetectionMs() { return conflictDetectionNanos / 1_000_000.0; }
+        public double getReplayMs() { return replayNanos / 1_000_000.0; }
+        public double getTotalMs() { return totalNanos / 1_000_000.0; }
+
+        @Override
+        public String toString() {
+            return "TimingStats{gitExtract=%.1fms, dtoLoad=%.1fms, conflictDetect=%.1fms, replay=%.1fms, total=%.1fms}"
+                    .formatted(getGitStateExtractionMs(), getDtoLoadingMs(),
+                            getConflictDetectionMs(), getReplayMs(), getTotalMs());
+        }
+    }
+
     private final Status status;
     private final List<MergeConflict> conflicts;
     private final List<EChange<HierarchicalId>> appliedChanges;
@@ -35,6 +74,7 @@ public class SemanticMergeResult {
     private final List<MergeConflict> warnings;
     private final Path mergedStateFolder;
     private final MergeDirection mergeDirection;
+    private TimingStats timingStats;
 
     private SemanticMergeResult(Status status, List<MergeConflict> conflicts,
                                 List<EChange<HierarchicalId>> appliedChanges,
@@ -128,6 +168,15 @@ public class SemanticMergeResult {
     public Path getMergedStateFolder() { return mergedStateFolder; }
     /** The merge direction used (FORWARD or REVERSED). */
     public MergeDirection getMergeDirection() { return mergeDirection; }
+
+    /** Per-phase timing statistics, or {@code null} if not captured. */
+    public TimingStats getTimingStats() { return timingStats; }
+
+    /** Sets per-phase timing statistics on this result. */
+    public SemanticMergeResult withTimingStats(TimingStats stats) {
+        this.timingStats = stats;
+        return this;
+    }
 
     @Override
     public String toString() {

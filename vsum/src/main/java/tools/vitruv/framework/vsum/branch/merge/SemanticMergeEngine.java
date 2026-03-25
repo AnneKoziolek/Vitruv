@@ -227,6 +227,10 @@ public class SemanticMergeEngine {
                 + "  |  Theirs (source): " + theirsSha.substring(0, 7));
 
         long mergeStartNanos = System.nanoTime();
+        long gitStateExtractionNanos = 0;
+        long dtoLoadingNanos = 0;
+        long conflictDetectionNanos = 0;
+        long replayPhaseNanos = 0;
 
         GitStateLoader loader = new GitStateLoader(repoRoot);
 
@@ -239,14 +243,16 @@ public class SemanticMergeEngine {
         loader.checkoutStateAtCommit(baseSha, baseDir);
         loader.checkoutStateAtCommit(theirsSha, theirsDir);
         loader.checkoutStateAtCommit(oursSha, oursDir);
-        LOGGER.info("[TIMING] Git state extraction: {} ms", (System.nanoTime() - phaseStart) / 1_000_000);
+        gitStateExtractionNanos = System.nanoTime() - phaseStart;
+        LOGGER.info("[TIMING] Git state extraction: {} ms", gitStateExtractionNanos / 1_000_000);
 
         // 2. Load changelog DTOs
         phaseStart = System.nanoTime();
         List<SemanticChangeLog.ChangeDto> oursDtos = loadAllDtosFromDir(oursDir);
         List<SemanticChangeLog.ChangeDto> theirsDtos = loadAllDtosFromDir(theirsDir);
+        dtoLoadingNanos = System.nanoTime() - phaseStart;
         LOGGER.info("Loaded {} ours DTOs, {} theirs DTOs", oursDtos.size(), theirsDtos.size());
-        LOGGER.info("[TIMING] DTO loading: {} ms", (System.nanoTime() - phaseStart) / 1_000_000);
+        LOGGER.info("[TIMING] DTO loading: {} ms", dtoLoadingNanos / 1_000_000);
         MergeTracer.trace("[LOAD] Loaded " + oursDtos.size() + " ours (target) changelog DTOs, "
                 + theirsDtos.size() + " theirs (source) changelog DTOs");
         if (!oursDtos.isEmpty()) {
@@ -265,7 +271,12 @@ public class SemanticMergeEngine {
         if (theirsDtos.isEmpty()) {
             LOGGER.info("No theirs changelog DTOs — nothing to replay");
             MergeTracer.trace("[RESULT] No source changes to replay — merge trivially succeeds");
-            return SemanticMergeResult.success(List.of(), oursDir);
+            long totalNanosEarly = System.nanoTime() - mergeStartNanos;
+            return SemanticMergeResult.success(List.of(), oursDir)
+                    .withTimingStats(new SemanticMergeResult.TimingStats()
+                            .gitStateExtraction(gitStateExtractionNanos)
+                            .dtoLoading(dtoLoadingNanos)
+                            .total(totalNanosEarly));
         }
 
         // 3. UUID-based conflict detection
@@ -292,7 +303,14 @@ public class SemanticMergeEngine {
                     MergeTracer.trace("");
                     MergeTracer.section("MERGE RESULT: CONFLICT (" + conflicts.size()
                             + " blocking conflict(s), merge aborted)");
-                    return SemanticMergeResult.conflict(conflicts);
+                    long totalNanosConflict = System.nanoTime() - mergeStartNanos;
+                    conflictDetectionNanos = System.nanoTime() - phaseStart;
+                    return SemanticMergeResult.conflict(conflicts)
+                            .withTimingStats(new SemanticMergeResult.TimingStats()
+                                    .gitStateExtraction(gitStateExtractionNanos)
+                                    .dtoLoading(dtoLoadingNanos)
+                                    .conflictDetection(conflictDetectionNanos)
+                                    .total(totalNanosConflict));
                 }
                 resolutions = conflictResolutionProvider.resolve(conflicts);
                 theirsDtos = filterByResolutions(theirsDtos, conflicts, resolutions);
@@ -302,7 +320,8 @@ public class SemanticMergeEngine {
             }
         }
 
-        LOGGER.info("[TIMING] Conflict detection: {} ms", (System.nanoTime() - phaseStart) / 1_000_000);
+        conflictDetectionNanos = System.nanoTime() - phaseStart;
+        LOGGER.info("[TIMING] Conflict detection: {} ms", conflictDetectionNanos / 1_000_000);
 
         // 4. Load changelog DTOs grouped by transaction for per-transaction replay
         List<List<SemanticChangeLog.ChangeDto>> theirsTransactions =
@@ -432,8 +451,9 @@ public class SemanticMergeEngine {
             targetVsum.dispose();
             throw new IOException("Semantic merge replay failed", e);
         }
+        replayPhaseNanos = System.nanoTime() - replayPhaseStart;
         LOGGER.info("[TIMING] Replay phase (all transactions): {} ms",
-                (System.nanoTime() - replayPhaseStart) / 1_000_000);
+                replayPhaseNanos / 1_000_000);
 
         targetVsum.dispose();
 
@@ -451,8 +471,17 @@ public class SemanticMergeEngine {
         List<MergeConflict> allWarnings = new ArrayList<>(warnings);
         allWarnings.addAll(indirectConflicts);
 
-        long totalMs = (System.nanoTime() - mergeStartNanos) / 1_000_000;
+        long totalNanos = System.nanoTime() - mergeStartNanos;
+        long totalMs = totalNanos / 1_000_000;
         LOGGER.info("[TIMING] Total merge: {} ms", totalMs);
+
+        // Build per-phase timing stats
+        SemanticMergeResult.TimingStats timingStats = new SemanticMergeResult.TimingStats()
+                .gitStateExtraction(gitStateExtractionNanos)
+                .dtoLoading(dtoLoadingNanos)
+                .conflictDetection(conflictDetectionNanos)
+                .replay(replayPhaseNanos)
+                .total(totalNanos);
 
         // Print final result summary
         String statusStr = resolutions.isEmpty() ? "SUCCESS" : "SUCCESS_WITH_RESOLUTIONS";
@@ -473,9 +502,11 @@ public class SemanticMergeEngine {
 
         if (!resolutions.isEmpty()) {
             return SemanticMergeResult.successWithResolutions(
-                    resolutions, allApplied, allWarnings, oursDir);
+                    resolutions, allApplied, allWarnings, oursDir)
+                    .withTimingStats(timingStats);
         }
-        return SemanticMergeResult.success(allApplied, allWarnings, oursDir);
+        return SemanticMergeResult.success(allApplied, allWarnings, oursDir)
+                .withTimingStats(timingStats);
     }
 
     /**
