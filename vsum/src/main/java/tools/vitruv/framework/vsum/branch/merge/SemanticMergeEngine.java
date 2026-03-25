@@ -104,21 +104,19 @@ public class SemanticMergeEngine {
         LOGGER.info("Bidirectional merge: base={}, A={}, B={}",
                 baseSha.substring(0, 7), branchASha.substring(0, 7), branchBSha.substring(0, 7));
 
-        System.out.println();
-        System.out.println("════════════════════════════════════════════════════════════════");
-        System.out.println("  MERGE TRACE: Bidirectional merge");
-        System.out.println("  Base: " + baseSha.substring(0, 7)
+        MergeTracer.trace("");
+        MergeTracer.section("MERGE TRACE: Bidirectional merge");
+        MergeTracer.trace("  Base: " + baseSha.substring(0, 7)
                 + "  |  Branch A: " + branchASha.substring(0, 7)
                 + "  |  Branch B: " + branchBSha.substring(0, 7));
-        System.out.println("════════════════════════════════════════════════════════════════");
 
         // 1. Try forward: replay A onto B (ours=B, theirs=A)
-        System.out.println("[BIDIR] Step 1: Attempting forward merge (A→B)...");
+        MergeTracer.trace("[BIDIR] Step 1: Attempting forward merge (A→B)...");
         SemanticMergeResult forwardResult = merge(baseSha, branchBSha, branchASha);
 
         // 2. If direct conflicts with no resolver, return immediately
         if (!forwardResult.isSuccess()) {
-            System.out.println("[BIDIR] Forward merge (A→B) failed with direct conflicts — aborting");
+            MergeTracer.trace("[BIDIR] Forward merge (A→B) failed with direct conflicts — aborting");
             return forwardResult;
         }
 
@@ -129,14 +127,14 @@ public class SemanticMergeEngine {
 
         if (forwardIndirect.isEmpty()) {
             LOGGER.info("Forward merge (A→B) clean — no indirect conflicts");
-            System.out.println("[BIDIR] Forward merge (A→B) clean — no indirect conflicts");
-            System.out.println("[BIDIR] Using forward result");
+            MergeTracer.trace("[BIDIR] Forward merge (A→B) clean — no indirect conflicts");
+            MergeTracer.trace("[BIDIR] Using forward result");
             return forwardResult;
         }
 
         LOGGER.info("Forward merge (A→B) has {} indirect conflict(s) — attempting reverse (B→A)",
                 forwardIndirect.size());
-        System.out.println("[BIDIR] Forward merge (A→B) has " + forwardIndirect.size()
+        MergeTracer.trace("[BIDIR] Forward merge (A→B) has " + forwardIndirect.size()
                 + " indirect conflict(s) — attempting reverse (B→A)");
 
         // 4. Try reverse: replay B onto A (ours=A, theirs=B)
@@ -161,7 +159,7 @@ public class SemanticMergeEngine {
 
         if (reverseIndirect.isEmpty()) {
             LOGGER.info("Reverse merge (B→A) clean — using reversed result");
-            System.out.println("[BIDIR] Reverse merge (B→A) clean — using REVERSED result");
+            MergeTracer.trace("[BIDIR] Reverse merge (B→A) clean — using REVERSED result");
             // Return reverse result annotated as REVERSED
             List<MergeConflict> reverseWarnings = reverseResult.getWarnings();
             if (!reverseResult.getAppliedResolutions().isEmpty()) {
@@ -181,7 +179,7 @@ public class SemanticMergeEngine {
 
         // 7. Both directions have indirect conflicts — true conflict
         LOGGER.warn("Both directions have indirect conflicts — escalating to true conflict");
-        System.out.println("[BIDIR] Both directions have indirect conflicts → BIDIRECTIONAL_INDIRECT_CONFLICT");
+        MergeTracer.trace("[BIDIR] Both directions have indirect conflicts → BIDIRECTIONAL_INDIRECT_CONFLICT");
         List<MergeConflict> bidirectionalConflicts = new ArrayList<>();
         for (MergeConflict ic : forwardIndirect) {
             bidirectionalConflicts.add(new MergeConflict(
@@ -222,13 +220,11 @@ public class SemanticMergeEngine {
         LOGGER.info("Semantic merge: base={}, ours={}, theirs={}",
                 baseSha.substring(0, 7), oursSha.substring(0, 7), theirsSha.substring(0, 7));
 
-        System.out.println();
-        System.out.println("════════════════════════════════════════════════════════════════");
-        System.out.println("  MERGE TRACE: Directed merge (replay theirs → ours)");
-        System.out.println("  Base: " + baseSha.substring(0, 7)
+        MergeTracer.trace("");
+        MergeTracer.section("MERGE TRACE: Directed merge (replay theirs → ours)");
+        MergeTracer.trace("  Base: " + baseSha.substring(0, 7)
                 + "  |  Ours (target): " + oursSha.substring(0, 7)
                 + "  |  Theirs (source): " + theirsSha.substring(0, 7));
-        System.out.println("════════════════════════════════════════════════════════════════");
 
         long mergeStartNanos = System.nanoTime();
 
@@ -251,24 +247,24 @@ public class SemanticMergeEngine {
         List<SemanticChangeLog.ChangeDto> theirsDtos = loadAllDtosFromDir(theirsDir);
         LOGGER.info("Loaded {} ours DTOs, {} theirs DTOs", oursDtos.size(), theirsDtos.size());
         LOGGER.info("[TIMING] DTO loading: {} ms", (System.nanoTime() - phaseStart) / 1_000_000);
-        System.out.println("[LOAD] Loaded " + oursDtos.size() + " ours (target) changelog DTOs, "
+        MergeTracer.trace("[LOAD] Loaded " + oursDtos.size() + " ours (target) changelog DTOs, "
                 + theirsDtos.size() + " theirs (source) changelog DTOs");
         if (!oursDtos.isEmpty()) {
-            System.out.println("[LOAD] Ours (target branch) changes:");
+            MergeTracer.trace("[LOAD] Ours (target branch) changes:");
             for (var dto : oursDtos) {
-                System.out.println("         " + formatChangeDto(dto));
+                MergeTracer.trace("         " + formatChangeDto(dto));
             }
         }
         if (!theirsDtos.isEmpty()) {
-            System.out.println("[LOAD] Theirs (source branch) changes:");
+            MergeTracer.trace("[LOAD] Theirs (source branch) changes:");
             for (var dto : theirsDtos) {
-                System.out.println("         " + formatChangeDto(dto));
+                MergeTracer.trace("         " + formatChangeDto(dto));
             }
         }
 
         if (theirsDtos.isEmpty()) {
             LOGGER.info("No theirs changelog DTOs — nothing to replay");
-            System.out.println("[RESULT] No source changes to replay — merge trivially succeeds");
+            MergeTracer.trace("[RESULT] No source changes to replay — merge trivially succeeds");
             return SemanticMergeResult.success(List.of(), oursDir);
         }
 
@@ -282,27 +278,25 @@ public class SemanticMergeEngine {
             conflicts = detector.detectConflicts(oursDtos, theirsDtos);
 
             if (conflicts.isEmpty()) {
-                System.out.println("[CONFLICT] No direct UUID-based conflicts detected");
+                MergeTracer.trace("[CONFLICT] No direct UUID-based conflicts detected");
             } else {
-                System.out.println("[CONFLICT] Detected " + conflicts.size() + " direct UUID-based conflict(s):");
+                MergeTracer.trace("[CONFLICT] Detected " + conflicts.size() + " direct UUID-based conflict(s):");
                 for (var c : conflicts) {
-                    System.out.println("           " + formatConflict(c));
+                    MergeTracer.trace("           " + formatConflict(c));
                 }
             }
 
             if (!conflicts.isEmpty()) {
                 if (conflictResolutionProvider == null) {
                     LOGGER.warn("Merge aborted: {} conflicts", conflicts.size());
-                    System.out.println();
-                    System.out.println("════════════════════════════════════════════════════════════════");
-                    System.out.println("  MERGE RESULT: CONFLICT (" + conflicts.size()
+                    MergeTracer.trace("");
+                    MergeTracer.section("MERGE RESULT: CONFLICT (" + conflicts.size()
                             + " blocking conflict(s), merge aborted)");
-                    System.out.println("════════════════════════════════════════════════════════════════");
                     return SemanticMergeResult.conflict(conflicts);
                 }
                 resolutions = conflictResolutionProvider.resolve(conflicts);
                 theirsDtos = filterByResolutions(theirsDtos, conflicts, resolutions);
-                System.out.println("[CONFLICT] Conflicts resolved — " + theirsDtos.size()
+                MergeTracer.trace("[CONFLICT] Conflicts resolved — " + theirsDtos.size()
                         + " DTOs remaining to replay");
                 LOGGER.info("After conflict resolution: {} DTOs to replay", theirsDtos.size());
             }
@@ -341,16 +335,16 @@ public class SemanticMergeEngine {
         // Collect user-authored footprints from target branch for conflict/warning checks
         Set<String> oursUserFootprints = collectUuidFootprints(oursDtos);
 
-        System.out.println("[REPLAY] Starting per-transaction replay ("
+        MergeTracer.trace("[REPLAY] Starting per-transaction replay ("
                 + theirsTransactions.size() + " transaction(s))");
         long replayPhaseStart = System.nanoTime();
         try {
             for (int i = 0; i < theirsTransactions.size(); i++) {
                 List<SemanticChangeLog.ChangeDto> txnDtos = theirsTransactions.get(i);
-                System.out.println("[REPLAY] ── Transaction " + (i + 1) + "/"
+                MergeTracer.trace("[REPLAY] ── Transaction " + (i + 1) + "/"
                         + theirsTransactions.size() + " (" + txnDtos.size() + " change(s)) ──");
                 for (var dto : txnDtos) {
-                    System.out.println("           replay: " + formatChangeDto(dto));
+                    MergeTracer.trace("           replay: " + formatChangeDto(dto));
                 }
 
                 // Build UUID-string → EObject map from the VSUM's model elements.
@@ -366,10 +360,10 @@ public class SemanticMergeEngine {
                         txnDtos, oursUserFootprints, uuidToElement));
                 int newWarnings = warnings.size() - warningsBefore;
                 if (newWarnings > 0) {
-                    System.out.println("           [WARNING] " + newWarnings
+                    MergeTracer.trace("           [WARNING] " + newWarnings
                             + " USER_VS_DERIVED_WARNING(s) detected before replay:");
                     for (int w = warningsBefore; w < warnings.size(); w++) {
-                        System.out.println("             → " + formatConflict(warnings.get(w)));
+                        MergeTracer.trace("             → " + formatConflict(warnings.get(w)));
                     }
                 }
 
@@ -418,13 +412,13 @@ public class SemanticMergeEngine {
                 }
                 int newIndirect = indirectConflicts.size() - indirectBefore;
                 if (newIndirect > 0) {
-                    System.out.println("           [INDIRECT] " + newIndirect
+                    MergeTracer.trace("           [INDIRECT] " + newIndirect
                             + " INDIRECT_CONFLICT(s) detected after replay:");
                     for (int ic = indirectBefore; ic < indirectConflicts.size(); ic++) {
-                        System.out.println("             → " + formatConflict(indirectConflicts.get(ic)));
+                        MergeTracer.trace("             → " + formatConflict(indirectConflicts.get(ic)));
                     }
                 }
-                System.out.println("           [REPLAY] Transaction " + (i + 1) + " complete — "
+                MergeTracer.trace("           [REPLAY] Transaction " + (i + 1) + " complete — "
                         + txnChanges.size() + " changes applied, "
                         + newIndirect + " indirect conflict(s), "
                         + newWarnings + " warning(s)");
@@ -461,23 +455,21 @@ public class SemanticMergeEngine {
         LOGGER.info("[TIMING] Total merge: {} ms", totalMs);
 
         // Print final result summary
-        System.out.println();
-        System.out.println("════════════════════════════════════════════════════════════════");
         String statusStr = resolutions.isEmpty() ? "SUCCESS" : "SUCCESS_WITH_RESOLUTIONS";
-        System.out.println("  MERGE RESULT: " + statusStr);
-        System.out.println("    Changes applied: " + allApplied.size());
-        System.out.println("    Warnings: " + allWarnings.size());
+        MergeTracer.trace("");
+        MergeTracer.section("MERGE RESULT: " + statusStr);
+        MergeTracer.trace("    Changes applied: " + allApplied.size());
+        MergeTracer.trace("    Warnings: " + allWarnings.size());
         if (!allWarnings.isEmpty()) {
             for (var w : allWarnings) {
-                System.out.println("      - " + formatConflict(w));
+                MergeTracer.trace("      - " + formatConflict(w));
             }
         }
-        System.out.println("    Conflicts: 0 (blocking)");
+        MergeTracer.trace("    Conflicts: 0 (blocking)");
         if (!resolutions.isEmpty()) {
-            System.out.println("    Resolutions applied: " + resolutions.size());
+            MergeTracer.trace("    Resolutions applied: " + resolutions.size());
         }
-        System.out.println("    Duration: " + totalMs + " ms");
-        System.out.println("════════════════════════════════════════════════════════════════");
+        MergeTracer.trace("    Duration: " + totalMs + " ms");
 
         if (!resolutions.isEmpty()) {
             return SemanticMergeResult.successWithResolutions(
