@@ -343,6 +343,13 @@ public class SemanticMergeEngine {
         String oursUriPrefix = org.eclipse.emf.common.util.URI.createFileURI(
                 oursDir.toAbsolutePath().toString()).toString();
 
+        // 5b. Load base VSUM for USER_VS_DERIVED_WARNING comparison.
+        // We need base values to distinguish "unchanged base" from "derived by reactions on B".
+        // Only warn when B's value differs from the base (truly derived), not when it's unchanged.
+        InternalVirtualModel baseVsum = GitStateLoader.loadVsumFromDir(baseDir, specs, interactionProvider);
+        Map<String, EObject> baseUuidToElement = buildUuidMap(baseVsum);
+        baseVsum.dispose();
+
         // 6. Replay each transaction separately (per-transaction restore/reactions)
         //    After each transaction:
         //    - Check indirect conflicts: derived(replay(A)) vs user(B)
@@ -376,7 +383,7 @@ public class SemanticMergeEngine {
                 // Uses the loaded VSUM to check element existence (not just changelogs).
                 int warningsBefore = warnings.size();
                 warnings.addAll(detectUserVsDerivedWarnings(
-                        txnDtos, oursUserFootprints, uuidToElement));
+                        txnDtos, oursUserFootprints, uuidToElement, baseUuidToElement));
                 int newWarnings = warnings.size() - warningsBefore;
                 if (newWarnings > 0) {
                     MergeTracer.trace("           [WARNING] " + newWarnings
@@ -761,7 +768,8 @@ public class SemanticMergeEngine {
     private List<MergeConflict> detectUserVsDerivedWarnings(
             List<SemanticChangeLog.ChangeDto> theirsTxnDtos,
             Set<String> oursUserFootprints,
-            Map<String, EObject> uuidToElement) {
+            Map<String, EObject> uuidToElement,
+            Map<String, EObject> baseUuidToElement) {
 
         List<MergeConflict> warnings = new ArrayList<>();
 
@@ -775,20 +783,45 @@ public class SemanticMergeEngine {
             if (oursUserFootprints.contains(footprint)) continue;
 
             // Check: does the element exist on the target branch's VSUM?
-            // If we can find it in the UUID map, the element exists — its current
-            // state was either from the base or derived by reactions on B.
-            // Either way, user(A) overwriting it deserves a warning.
-            boolean elementExistsOnB = uuidToElement.containsKey(dto.affectedElementUuid);
+            EObject elementOnB = uuidToElement.get(dto.affectedElementUuid);
+            if (elementOnB == null) continue;
 
-            if (elementExistsOnB) {
-                warnings.add(new MergeConflict(
-                        dto.affectedElementUuid,
-                        MergeConflict.ConflictType.USER_VS_DERIVED_WARNING,
-                        dto.affectedElementUuid, dto.featureName,
-                        null, null, String.valueOf(dto.newLiteralValue)));
-                LOGGER.info("Warning: user(A) overwrites derived(B) state: uuid={}, feature={}",
-                        dto.affectedElementUuid, dto.featureName);
+            // Compare B's value against the base value.
+            // Only warn if the value on B DIFFERS from the base — meaning reactions on B
+            // actually derived a new value. If B's value equals the base, this is just
+            // an unchanged base value and A's change is a normal three-way merge application.
+            EObject elementOnBase = baseUuidToElement.get(dto.affectedElementUuid);
+            if (elementOnBase != null) {
+                var feature = elementOnB.eClass().getEStructuralFeature(dto.featureName);
+                if (feature != null) {
+                    Object valueOnB = elementOnB.eGet(feature);
+                    var baseFeature = elementOnBase.eClass().getEStructuralFeature(dto.featureName);
+                    Object valueOnBase = baseFeature != null ? elementOnBase.eGet(baseFeature) : null;
+                    if (java.util.Objects.equals(valueOnB, valueOnBase)) {
+                        // Value on B is unchanged from base — not derived, skip warning
+                        LOGGER.debug("Skipping warning for uuid={}, feature={}: value on B ({}) "
+                                + "equals base (unchanged)", dto.affectedElementUuid,
+                                dto.featureName, valueOnB);
+                        continue;
+                    }
+                }
             }
+            // Element doesn't exist in base (created by reactions on B) or value differs → warning
+            String oursValue = null;
+            var feature = elementOnB.eClass().getEStructuralFeature(dto.featureName);
+            if (feature != null) {
+                Object val = elementOnB.eGet(feature);
+                oursValue = val != null ? val.toString() : null;
+            }
+            warnings.add(new MergeConflict(
+                    dto.affectedElementUuid,
+                    MergeConflict.ConflictType.USER_VS_DERIVED_WARNING,
+                    dto.affectedElementUuid, dto.featureName,
+                    oursValue, null, String.valueOf(dto.newLiteralValue)));
+            LOGGER.info("Warning: user(A) overwrites derived(B) state: uuid={}, feature={}, "
+                    + "valueOnB={}, valueOnBase={}",
+                    dto.affectedElementUuid, dto.featureName, oursValue,
+                    elementOnBase != null ? "exists" : "absent");
         }
         return warnings;
     }
