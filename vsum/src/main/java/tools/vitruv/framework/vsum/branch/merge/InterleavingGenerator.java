@@ -120,4 +120,17 @@ public class InterleavingGenerator {
         result.addAll(b);
         return result;
     }
+
+    /**
+     * Returns the single topologically-sorted ordering derived from the dependency graph,
+     * or an empty list if the graph has a cycle (meaning no valid ordering exists).
+     *
+     * @param graph the commit dependency graph
+     * @return singleton list containing the topological ordering, or empty list on cycle
+     */
+    public List<List<Boolean>> generateFromDependencyGraph(CommitDependencyGraph graph) {
+        List<Boolean> ordering = graph.topologicalSort();
+        if (ordering == null) return List.of(); // cycle
+        return List.of(ordering);
+    }
 }

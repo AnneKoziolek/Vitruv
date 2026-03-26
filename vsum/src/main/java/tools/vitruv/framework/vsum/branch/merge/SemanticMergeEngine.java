@@ -5,6 +5,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -233,20 +234,19 @@ public class SemanticMergeEngine {
      *         if a clean ordering is found, or a conflict otherwise
      */
     public SemanticMergeResult mergeWithInterleaving(String baseSha, String branchASha, String branchBSha)
-            throws IOException, GitAPIException {
+            throws IOException, org.eclipse.jgit.api.errors.GitAPIException {
 
         LOGGER.info("Interleaving merge: base={}, A={}, B={}",
                 baseSha.substring(0, 7), branchASha.substring(0, 7), branchBSha.substring(0, 7));
 
         MergeTracer.trace("");
-        MergeTracer.section("MERGE TRACE: Interleaving merge");
+        MergeTracer.section("MERGE TRACE: Interleaving merge (dependency-graph-based)");
         MergeTracer.trace("  Base: " + baseSha.substring(0, 7)
                 + "  |  Branch A: " + branchASha.substring(0, 7)
                 + "  |  Branch B: " + branchBSha.substring(0, 7));
 
         GitStateLoader loader = new GitStateLoader(repoRoot);
 
-        // Extract base, A and B states to temp dirs
         Path baseDir = GitStateLoader.createTempDir("interleave-base-");
         Path aDirFull = GitStateLoader.createTempDir("interleave-a-");
         Path bDirFull = GitStateLoader.createTempDir("interleave-b-");
@@ -255,27 +255,22 @@ public class SemanticMergeEngine {
         loader.checkoutStateAtCommit(branchASha, aDirFull);
         loader.checkoutStateAtCommit(branchBSha, bDirFull);
 
-        // Load all changelog transactions from A and B (relative to base)
         List<List<SemanticChangeLog.ChangeDto>> aTransactions = loadTransactionsFromDir(aDirFull);
         List<List<SemanticChangeLog.ChangeDto>> bTransactions = loadTransactionsFromDir(bDirFull);
 
-        // Collect flat DTOs for direct conflict detection (same as directed merge)
         List<SemanticChangeLog.ChangeDto> aDtos = aTransactions.stream().flatMap(List::stream).toList();
         List<SemanticChangeLog.ChangeDto> bDtos = bTransactions.stream().flatMap(List::stream).toList();
 
-        // Check for direct (MODIFY_MODIFY) conflicts first — these can't be resolved by ordering
+        // Check direct (MODIFY_MODIFY) conflicts — cannot be resolved by reordering
         UuidConflictDetector detector = new UuidConflictDetector();
         List<MergeConflict> directConflicts = detector.detectConflicts(aDtos, bDtos);
-        if (!directConflicts.isEmpty()) {
-            if (conflictResolutionProvider == null) {
-                LOGGER.warn("Interleaving merge aborted: {} direct conflicts", directConflicts.size());
-                return SemanticMergeResult.conflict(directConflicts);
-            }
+        if (!directConflicts.isEmpty() && conflictResolutionProvider == null) {
+            LOGGER.warn("Interleaving merge aborted: {} direct conflicts", directConflicts.size());
+            return SemanticMergeResult.conflict(directConflicts);
         }
 
         int m = aTransactions.size();
         int n = bTransactions.size();
-        LOGGER.info("Interleaving merge: {} A-transactions, {} B-transactions", m, n);
 
         if (m == 0 && n == 0) {
             return SemanticMergeResult.success(List.of(), baseDir);
@@ -286,23 +281,323 @@ public class SemanticMergeEngine {
         Map<String, EObject> baseUuidToElement = buildUuidMap(baseVsum);
         baseVsum.dispose();
 
+        // Compute direct footprints (free — from changelog DTOs)
+        List<Set<String>> aDirectFP = aTransactions.stream()
+                .map(this::collectUuidFootprints).toList();
+        List<Set<String>> bDirectFP = bTransactions.stream()
+                .map(this::collectUuidFootprints).toList();
+
+        // Compute initial estimated reaction footprints by replaying each commit in isolation on base
+        CommitDependencyAnalyzer analyzer = new CommitDependencyAnalyzer(specs, interactionProvider);
+        List<Set<String>> aReactionFP = new ArrayList<>();
+        List<Set<String>> bReactionFP = new ArrayList<>();
+        boolean depAnalysisOk = true;
+        try {
+            MergeTracer.trace("[INTERLEAVE] Computing reaction footprints for " + m + " A-commits and " + n + " B-commits");
+            for (int i = 0; i < m; i++) {
+                Set<String> fp = analyzer.computeReactionFootprintOnBase(aTransactions.get(i), baseDir);
+                aReactionFP.add(new HashSet<>(fp));
+                LOGGER.debug("A[{}] reactionFP = {}", i, fp);
+            }
+            for (int j = 0; j < n; j++) {
+                Set<String> fp = analyzer.computeReactionFootprintOnBase(bTransactions.get(j), baseDir);
+                bReactionFP.add(new HashSet<>(fp));
+                LOGGER.debug("B[{}] reactionFP = {}", j, fp);
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Dependency analysis failed ({}), falling back to enumeration", e.getMessage());
+            depAnalysisOk = false;
+        }
+
+        if (!depAnalysisOk) {
+            return mergeWithInterleavingEnumeration(baseDir, aTransactions, bTransactions,
+                    aDtos, bDtos, baseUuidToElement, m, n);
+        }
+
+        // Iterative fixpoint loop
+        int maxIterations = m + n + 2;
+        for (int iteration = 0; iteration < maxIterations; iteration++) {
+            LOGGER.info("[INTERLEAVE] Iteration {} / {}", iteration + 1, maxIterations);
+            MergeTracer.trace("[INTERLEAVE] Dependency-graph iteration " + (iteration + 1));
+
+            // Build dependency graph
+            CommitDependencyGraph graph = new CommitDependencyGraph(m, n);
+
+            for (int i = 0; i < m; i++) {
+                for (int j = 0; j < n; j++) {
+                    // If a_i's reaction touches b_j's direct changes: a_i must precede b_j.
+                    // Reason: replaying a_i FIRST fires its reaction (derives the value), then
+                    // b_j's user change overwrites that derived value → USER_VS_DERIVED_WARNING (non-blocking).
+                    // If b_j came first, b_j's user change would later be overwritten by a_i's reaction
+                    // → INDIRECT_CONFLICT (blocking). So a_i → b_j.
+                    Set<String> aRxnOverlapBDirect = new HashSet<>(aReactionFP.get(i));
+                    aRxnOverlapBDirect.retainAll(bDirectFP.get(j));
+                    if (!aRxnOverlapBDirect.isEmpty()) {
+                        LOGGER.debug("Edge A[{}] → B[{}] (aReaction ∩ bDirect = {})", i, j, aRxnOverlapBDirect);
+                        graph.addEdge(graph.nodeA(i), graph.nodeB(j));
+                    }
+
+                    // If b_j's reaction touches a_i's direct changes: b_j must precede a_i.
+                    // Reason: same logic in reverse — b_j first, reaction derives, then a_i user overwrites. b_j → a_i.
+                    Set<String> bRxnOverlapADirect = new HashSet<>(bReactionFP.get(j));
+                    bRxnOverlapADirect.retainAll(aDirectFP.get(i));
+                    if (!bRxnOverlapADirect.isEmpty()) {
+                        LOGGER.debug("Edge B[{}] → A[{}] (bReaction ∩ aDirect = {})", j, i, bRxnOverlapADirect);
+                        graph.addEdge(graph.nodeB(j), graph.nodeA(i));
+                    }
+                }
+            }
+
+            // Check for cycle
+            if (graph.hasCycle()) {
+                LOGGER.warn("[INTERLEAVE] Dependency graph has cycle → INTERLEAVING_CONFLICT");
+                MergeTracer.trace("[INTERLEAVE] Dependency graph cycle → INTERLEAVING_CONFLICT");
+                List<MergeConflict> conflicts = new ArrayList<>();
+                for (int[] pair : graph.getCyclicPairs()) {
+                    int ai = pair[0], bj = pair[1];
+                    Set<String> overlap = new HashSet<>(aReactionFP.get(ai));
+                    overlap.retainAll(bDirectFP.get(bj));
+                    Set<String> overlapB = new HashSet<>(bReactionFP.get(bj));
+                    overlapB.retainAll(aDirectFP.get(ai));
+                    overlap.addAll(overlapB);
+                    for (String fp : overlap) {
+                        String[] parts = fp.split("#", 2);
+                        conflicts.add(new MergeConflict(
+                                parts[0], MergeConflict.ConflictType.INTERLEAVING_CONFLICT,
+                                parts[0], parts.length > 1 ? parts[1] : null,
+                                null, null, null));
+                    }
+                }
+                if (conflicts.isEmpty()) {
+                    conflicts.add(new MergeConflict("unknown",
+                            MergeConflict.ConflictType.INTERLEAVING_CONFLICT,
+                            null, null, null, null, null));
+                }
+                return SemanticMergeResult.conflict(conflicts);
+            }
+
+            // Topological sort → proposed ordering
+            List<Boolean> ordering = graph.topologicalSort();
+            MergeTracer.trace("[INTERLEAVE] Proposed ordering: " + orderingToString(ordering));
+
+            // Execute ordering, capture actual reaction footprints per step
+            Path tryDir = GitStateLoader.createTempDir("interleave-try-");
+            copyDirectory(baseDir, tryDir);
+
+            InterleavingReplayResult replayResult = tryInterleavingWithFootprintCapture(
+                    tryDir, aTransactions, bTransactions, ordering,
+                    aDtos, bDtos, baseUuidToElement);
+
+            // Check if actual reaction footprints add new entries (monotone union)
+            boolean fixedPoint = true;
+            for (int i = 0; i < m; i++) {
+                Set<String> actual = replayResult.actualAReactionFP().get(i);
+                if (actual != null && !aReactionFP.get(i).containsAll(actual)) {
+                    LOGGER.info("[INTERLEAVE] A[{}] gained new reaction footprint entries: {}",
+                            i, minus(actual, aReactionFP.get(i)));
+                    aReactionFP.get(i).addAll(actual);
+                    fixedPoint = false;
+                }
+            }
+            for (int j = 0; j < n; j++) {
+                Set<String> actual = replayResult.actualBReactionFP().get(j);
+                if (actual != null && !bReactionFP.get(j).containsAll(actual)) {
+                    LOGGER.info("[INTERLEAVE] B[{}] gained new reaction footprint entries: {}",
+                            j, minus(actual, bReactionFP.get(j)));
+                    bReactionFP.get(j).addAll(actual);
+                    fixedPoint = false;
+                }
+            }
+
+            if (fixedPoint) {
+                LOGGER.info("[INTERLEAVE] Fixed point reached at iteration {}", iteration + 1);
+                MergeTracer.trace("[INTERLEAVE] Fixed point at iteration " + (iteration + 1));
+                SemanticMergeResult result = replayResult.result();
+                List<MergeConflict> indirectInResult = result.getWarnings().stream()
+                        .filter(w -> w.getType() == MergeConflict.ConflictType.INDIRECT_CONFLICT)
+                        .toList();
+                if (indirectInResult.isEmpty()) {
+                    return SemanticMergeResult.success(
+                            result.getAppliedChanges(), result.getWarnings(),
+                            result.getMergedStateFolder(),
+                            SemanticMergeResult.MergeDirection.INTERLEAVED);
+                } else {
+                    List<MergeConflict> escalated = indirectInResult.stream()
+                            .map(ic -> new MergeConflict(ic.getElementId(),
+                                    MergeConflict.ConflictType.INTERLEAVING_CONFLICT,
+                                    ic.getElementUuid(), ic.getConflictingFeature(),
+                                    ic.getBaseValue(), ic.getOursValue(), ic.getTheirsValue()))
+                            .toList();
+                    return SemanticMergeResult.conflict(escalated);
+                }
+            }
+            MergeTracer.trace("[INTERLEAVE] New reaction footprints discovered — re-sorting");
+        }
+
+        // Max iterations exceeded
+        LOGGER.warn("[INTERLEAVE] Max iterations ({}) exceeded", maxIterations);
+        return SemanticMergeResult.conflict(List.of(new MergeConflict("unknown",
+                MergeConflict.ConflictType.INTERLEAVING_CONFLICT, null, null, null, null, null)));
+    }
+
+    /** Result of a single interleaving attempt, including per-commit actual reaction footprints. */
+    private record InterleavingReplayResult(
+            SemanticMergeResult result,
+            Map<Integer, Set<String>> actualAReactionFP,
+            Map<Integer, Set<String>> actualBReactionFP
+    ) {}
+
+    private InterleavingReplayResult tryInterleavingWithFootprintCapture(
+            Path baseWorkDir,
+            List<List<SemanticChangeLog.ChangeDto>> aTransactions,
+            List<List<SemanticChangeLog.ChangeDto>> bTransactions,
+            List<Boolean> ordering,
+            List<SemanticChangeLog.ChangeDto> allADtos,
+            List<SemanticChangeLog.ChangeDto> allBDtos,
+            Map<String, EObject> baseUuidToElement) throws IOException {
+
+        String uriPrefix = org.eclipse.emf.common.util.URI.createFileURI(
+                baseWorkDir.toAbsolutePath().toString()).toString();
+
+        InternalVirtualModel vsum = GitStateLoader.loadVsumFromDir(baseWorkDir, specs, interactionProvider);
+
+        List<EChange<HierarchicalId>> allApplied = new ArrayList<>();
+        List<MergeConflict> indirectConflicts = new ArrayList<>();
+        List<MergeConflict> warnings = new ArrayList<>();
+
+        Set<String> aFootprintsSoFar = new HashSet<>();
+        Set<String> bFootprintsSoFar = new HashSet<>();
+
+        Map<Integer, Set<String>> actualAReactionFP = new HashMap<>();
+        Map<Integer, Set<String>> actualBReactionFP = new HashMap<>();
+
+        int aIdx = 0, bIdx = 0;
+
+        try {
+            for (int step = 0; step < ordering.size(); step++) {
+                boolean fromA = ordering.get(step);
+                List<SemanticChangeLog.ChangeDto> txnDtos;
+                Set<String> otherBranchFootprintsSoFar;
+                int txnIndex;
+
+                if (fromA) {
+                    if (aIdx >= aTransactions.size()) continue;
+                    txnIndex = aIdx;
+                    txnDtos = aTransactions.get(aIdx++);
+                    otherBranchFootprintsSoFar = new HashSet<>(bFootprintsSoFar);
+                } else {
+                    if (bIdx >= bTransactions.size()) continue;
+                    txnIndex = bIdx;
+                    txnDtos = bTransactions.get(bIdx++);
+                    otherBranchFootprintsSoFar = new HashSet<>(aFootprintsSoFar);
+                }
+
+                if (txnDtos.isEmpty()) continue;
+
+                Set<String> txnFootprints = collectUuidFootprints(txnDtos);
+                if (fromA) {
+                    aFootprintsSoFar.addAll(txnFootprints);
+                } else {
+                    bFootprintsSoFar.addAll(txnFootprints);
+                }
+
+                Map<String, EObject> uuidToElement = buildUuidMap(vsum);
+
+                warnings.addAll(detectUserVsDerivedWarnings(
+                        txnDtos, otherBranchFootprintsSoFar, uuidToElement, baseUuidToElement));
+
+                Map<String, Object> preReplayValues = snapshotUserFootprintValues(
+                        otherBranchFootprintsSoFar, uuidToElement);
+
+                List<SemanticChangeLog.ChangeDto> otherDtos = new ArrayList<>();
+                for (String fp : otherBranchFootprintsSoFar) {
+                    String[] parts = fp.split("#", 2);
+                    SemanticChangeLog.ChangeDto d = new SemanticChangeLog.ChangeDto();
+                    d.affectedElementUuid = parts[0];
+                    d.featureName = parts.length > 1 ? parts[1] : null;
+                    otherDtos.add(d);
+                }
+
+                ChangeDtoDeserializer deserializer = new ChangeDtoDeserializer(null, uriPrefix);
+                List<EChange<HierarchicalId>> txnChanges = deserializer.deserializeAll(txnDtos);
+                if (txnChanges.isEmpty()) continue;
+
+                DerivedChangeCapture derivedCapture = new DerivedChangeCapture();
+                vsum.addChangePropagationListener(derivedCapture);
+
+                replayChanges(vsum, txnChanges);
+
+                vsum.removeChangePropagationListener(derivedCapture);
+                allApplied.addAll(txnChanges);
+
+                // Record actual reaction footprint for this commit
+                Set<String> actualFP = CommitDependencyAnalyzer.extractFootprintsFromCapture(
+                        derivedCapture.getDerivedChanges(), vsum.getUuidResolver());
+                if (fromA) {
+                    actualAReactionFP.put(txnIndex, actualFP);
+                } else {
+                    actualBReactionFP.put(txnIndex, actualFP);
+                }
+
+                List<MergeConflict> txnIndirect = detectIndirectConflicts(
+                        derivedCapture.getDerivedChanges(), otherDtos, vsum.getUuidResolver());
+
+                Set<String> thisTxnDirectFootprints = collectUuidFootprints(txnDtos);
+                Map<String, EObject> postReplayMap = buildUuidMap(vsum);
+                txnIndirect.addAll(detectIndirectConflictsViaSnapshot(
+                        preReplayValues, otherBranchFootprintsSoFar,
+                        thisTxnDirectFootprints, postReplayMap));
+
+                Set<String> seen = new HashSet<>();
+                for (MergeConflict ic : txnIndirect) {
+                    String key = ic.getElementUuid() + "#" + ic.getConflictingFeature();
+                    if (seen.add(key)) {
+                        indirectConflicts.add(ic);
+                    }
+                }
+
+                LOGGER.debug("Step {}: replayed {} changes from {}, {} indirect conflicts so far",
+                        step + 1, txnChanges.size(), fromA ? "A" : "B", indirectConflicts.size());
+            }
+        } catch (Exception e) {
+            LOGGER.error("Interleaving replay failed: {}", e.getMessage(), e);
+            vsum.dispose();
+            throw new IOException("Interleaving replay failed", e);
+        }
+
+        vsum.dispose();
+
+        List<MergeConflict> allWarnings = new ArrayList<>(warnings);
+        allWarnings.addAll(indirectConflicts);
+
+        SemanticMergeResult result = SemanticMergeResult.success(allApplied, allWarnings, baseWorkDir);
+        return new InterleavingReplayResult(result, actualAReactionFP, actualBReactionFP);
+    }
+
+    private SemanticMergeResult mergeWithInterleavingEnumeration(
+            Path baseDir,
+            List<List<SemanticChangeLog.ChangeDto>> aTransactions,
+            List<List<SemanticChangeLog.ChangeDto>> bTransactions,
+            List<SemanticChangeLog.ChangeDto> aDtos,
+            List<SemanticChangeLog.ChangeDto> bDtos,
+            Map<String, EObject> baseUuidToElement,
+            int m, int n) throws IOException {
+
         // Generate candidate orderings
         InterleavingGenerator generator = new InterleavingGenerator();
         List<List<Boolean>> orderings = generator.generate(m, n);
-        LOGGER.info("Testing {} interleaving ordering(s)", orderings.size());
+        LOGGER.info("[FALLBACK] Testing {} interleaving ordering(s)", orderings.size());
 
-        // Track best result (fewest indirect conflicts) for fallback
         SemanticMergeResult bestResult = null;
         int bestConflictCount = Integer.MAX_VALUE;
 
         for (int oi = 0; oi < orderings.size(); oi++) {
             List<Boolean> ordering = orderings.get(oi);
-            LOGGER.info("Trying ordering {}/{}: {}", oi + 1, orderings.size(),
+            LOGGER.info("[FALLBACK] Trying ordering {}/{}: {}", oi + 1, orderings.size(),
                     orderingToString(ordering));
-            MergeTracer.trace("[INTERLEAVE] Trying ordering " + (oi + 1) + "/" + orderings.size()
+            MergeTracer.trace("[FALLBACK] Trying ordering " + (oi + 1) + "/" + orderings.size()
                     + ": " + orderingToString(ordering));
 
-            // Copy base dir to fresh temp dir for this ordering
             Path tryDir = GitStateLoader.createTempDir("interleave-try-");
             copyDirectory(baseDir, tryDir);
 
@@ -316,9 +611,8 @@ public class SemanticMergeEngine {
                         .toList();
 
                 if (indirectInResult.isEmpty()) {
-                    LOGGER.info("Found clean interleaving at ordering {}/{}", oi + 1, orderings.size());
-                    MergeTracer.trace("[INTERLEAVE] Clean ordering found at attempt " + (oi + 1));
-                    // Return success with INTERLEAVED direction
+                    LOGGER.info("[FALLBACK] Found clean interleaving at ordering {}/{}", oi + 1, orderings.size());
+                    MergeTracer.trace("[FALLBACK] Clean ordering found at attempt " + (oi + 1));
                     return SemanticMergeResult.success(
                             result.getAppliedChanges(),
                             result.getWarnings(),
@@ -334,11 +628,9 @@ public class SemanticMergeEngine {
             }
         }
 
-        // No ordering found — escalate to INTERLEAVING_CONFLICT
-        LOGGER.warn("No clean interleaving found — escalating to INTERLEAVING_CONFLICT");
-        MergeTracer.trace("[INTERLEAVE] No clean ordering found → INTERLEAVING_CONFLICT");
+        LOGGER.warn("[FALLBACK] No clean interleaving found — escalating to INTERLEAVING_CONFLICT");
+        MergeTracer.trace("[FALLBACK] No clean ordering found → INTERLEAVING_CONFLICT");
 
-        // Collect all indirect conflicts from the best attempt (for reporting)
         List<MergeConflict> interleavingConflicts = new ArrayList<>();
         if (bestResult != null) {
             for (MergeConflict w : bestResult.getWarnings()) {
@@ -358,6 +650,12 @@ public class SemanticMergeEngine {
                     null, null, null, null, null));
         }
         return SemanticMergeResult.conflict(interleavingConflicts);
+    }
+
+    private static Set<String> minus(Set<String> a, Set<String> b) {
+        Set<String> result = new HashSet<>(a);
+        result.removeAll(b);
+        return result;
     }
 
     /**
@@ -502,7 +800,7 @@ public class SemanticMergeEngine {
      * Copies a directory recursively from {@code source} to {@code target}.
      * Used to clone the base state for each interleaving candidate.
      */
-    private static void copyDirectory(Path source, Path target) throws IOException {
+    static void copyDirectory(Path source, Path target) throws IOException {
         try (var walk = Files.walk(source)) {
             for (Path src : walk.toList()) {
                 Path dest = target.resolve(source.relativize(src));
@@ -857,8 +1155,8 @@ public class SemanticMergeEngine {
      * across coupled models.
      */
     @SuppressWarnings("unchecked")
-    private void replayChanges(InternalVirtualModel targetVsum,
-                                List<EChange<HierarchicalId>> changes) {
+    static void replayChanges(InternalVirtualModel targetVsum,
+                               List<EChange<HierarchicalId>> changes) {
 
         // Create a ChangeRecordingView on all model objects
         var selector = targetVsum.createSelector(
@@ -888,7 +1186,7 @@ public class SemanticMergeEngine {
      * ChangeRecorder captures (unlike ApplyEChangeSwitch which uses EditingDomain Commands).
      */
     @SuppressWarnings("unchecked")
-    private void applyChangeReflectively(EChange<HierarchicalId> eChange,
+    private static void applyChangeReflectively(EChange<HierarchicalId> eChange,
                                           tools.vitruv.change.atomic.hid.internal.HierarchicalIdResolver idResolver) {
         if (eChange instanceof tools.vitruv.change.atomic.eobject.CreateEObject<HierarchicalId> ce) {
             EObject created = EcoreUtil.create(ce.getAffectedEObjectType());
@@ -1327,7 +1625,7 @@ public class SemanticMergeEngine {
      * Captures derived (propagated) changes during a single {@code propagateChange()} call.
      * Used for indirect conflict detection after each replayed transaction.
      */
-    private static class DerivedChangeCapture implements ChangePropagationListener {
+    static class DerivedChangeCapture implements ChangePropagationListener {
         private final List<PropagatedChange> derivedChanges = new ArrayList<>();
 
         @Override
