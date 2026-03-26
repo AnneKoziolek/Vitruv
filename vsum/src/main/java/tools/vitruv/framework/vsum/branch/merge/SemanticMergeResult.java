@@ -25,7 +25,9 @@ public class SemanticMergeResult {
         /** A→B: source replayed onto target (default). */
         FORWARD,
         /** B→A: reverse replay was used because forward had indirect conflicts. */
-        REVERSED
+        REVERSED,
+        /** Interleaved: commits from A and B were replayed from base in an interleaved order. */
+        INTERLEAVED
     }
 
     /**
@@ -180,7 +182,11 @@ public class SemanticMergeResult {
 
     @Override
     public String toString() {
-        String dirSuffix = mergeDirection == MergeDirection.REVERSED ? ", direction=REVERSED" : "";
+        String dirSuffix = switch (mergeDirection) {
+            case REVERSED -> ", direction=REVERSED";
+            case INTERLEAVED -> ", direction=INTERLEAVED";
+            default -> "";
+        };
         return switch (status) {
             case SUCCESS -> "SemanticMergeResult{SUCCESS, %d changes applied%s}"
                     .formatted(appliedChanges.size(), dirSuffix);

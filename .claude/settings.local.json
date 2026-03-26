@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tar tf:*)",
+      "Bash(mkdir -p ~/claude-container-backup)",
+      "Bash(tar xf:*)",
+      "Bash(docker tag:*)",
+      "Bash(export DOCKER_BUILDKIT=0)",
+      "Bash(docker pull:*)",
+      "Bash(docker rmi:*)",
+      "Bash(docker info:*)",
+      "Bash(curl -sI https://mcr.microsoft.com/v2/devcontainers/java/manifests/1-17-bullseye)",
+      "Bash(docker run:*)",
+      "Bash(docker system:*)"
+    ]
+  }
+}

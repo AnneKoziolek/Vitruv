@@ -214,6 +214,318 @@ public class SemanticMergeEngine {
                 .toList();
     }
 
+    /**
+     * Performs an interleaved merge of two branches by trying different commit orderings
+     * from the common base.
+     *
+     * <p>Instead of replaying all A commits then all B commits (or vice versa), this method
+     * tries different interleavings of commits from A and B, starting fresh from the base
+     * state for each candidate ordering. The first ordering that produces no indirect
+     * conflicts is returned as the merged result.
+     *
+     * <p>If no ordering avoids indirect conflicts, returns a conflict with type
+     * {@link MergeConflict.ConflictType#INTERLEAVING_CONFLICT}.
+     *
+     * @param baseSha    common ancestor commit SHA
+     * @param branchASha commit SHA of branch A
+     * @param branchBSha commit SHA of branch B
+     * @return the merge result with {@link SemanticMergeResult.MergeDirection#INTERLEAVED}
+     *         if a clean ordering is found, or a conflict otherwise
+     */
+    public SemanticMergeResult mergeWithInterleaving(String baseSha, String branchASha, String branchBSha)
+            throws IOException, GitAPIException {
+
+        LOGGER.info("Interleaving merge: base={}, A={}, B={}",
+                baseSha.substring(0, 7), branchASha.substring(0, 7), branchBSha.substring(0, 7));
+
+        MergeTracer.trace("");
+        MergeTracer.section("MERGE TRACE: Interleaving merge");
+        MergeTracer.trace("  Base: " + baseSha.substring(0, 7)
+                + "  |  Branch A: " + branchASha.substring(0, 7)
+                + "  |  Branch B: " + branchBSha.substring(0, 7));
+
+        GitStateLoader loader = new GitStateLoader(repoRoot);
+
+        // Extract base, A and B states to temp dirs
+        Path baseDir = GitStateLoader.createTempDir("interleave-base-");
+        Path aDirFull = GitStateLoader.createTempDir("interleave-a-");
+        Path bDirFull = GitStateLoader.createTempDir("interleave-b-");
+
+        loader.checkoutStateAtCommit(baseSha, baseDir);
+        loader.checkoutStateAtCommit(branchASha, aDirFull);
+        loader.checkoutStateAtCommit(branchBSha, bDirFull);
+
+        // Load all changelog transactions from A and B (relative to base)
+        List<List<SemanticChangeLog.ChangeDto>> aTransactions = loadTransactionsFromDir(aDirFull);
+        List<List<SemanticChangeLog.ChangeDto>> bTransactions = loadTransactionsFromDir(bDirFull);
+
+        // Collect flat DTOs for direct conflict detection (same as directed merge)
+        List<SemanticChangeLog.ChangeDto> aDtos = aTransactions.stream().flatMap(List::stream).toList();
+        List<SemanticChangeLog.ChangeDto> bDtos = bTransactions.stream().flatMap(List::stream).toList();
+
+        // Check for direct (MODIFY_MODIFY) conflicts first — these can't be resolved by ordering
+        UuidConflictDetector detector = new UuidConflictDetector();
+        List<MergeConflict> directConflicts = detector.detectConflicts(aDtos, bDtos);
+        if (!directConflicts.isEmpty()) {
+            if (conflictResolutionProvider == null) {
+                LOGGER.warn("Interleaving merge aborted: {} direct conflicts", directConflicts.size());
+                return SemanticMergeResult.conflict(directConflicts);
+            }
+        }
+
+        int m = aTransactions.size();
+        int n = bTransactions.size();
+        LOGGER.info("Interleaving merge: {} A-transactions, {} B-transactions", m, n);
+
+        if (m == 0 && n == 0) {
+            return SemanticMergeResult.success(List.of(), baseDir);
+        }
+
+        // Load base VSUM for USER_VS_DERIVED_WARNING comparison
+        InternalVirtualModel baseVsum = GitStateLoader.loadVsumFromDir(baseDir, specs, interactionProvider);
+        Map<String, EObject> baseUuidToElement = buildUuidMap(baseVsum);
+        baseVsum.dispose();
+
+        // Generate candidate orderings
+        InterleavingGenerator generator = new InterleavingGenerator();
+        List<List<Boolean>> orderings = generator.generate(m, n);
+        LOGGER.info("Testing {} interleaving ordering(s)", orderings.size());
+
+        // Track best result (fewest indirect conflicts) for fallback
+        SemanticMergeResult bestResult = null;
+        int bestConflictCount = Integer.MAX_VALUE;
+
+        for (int oi = 0; oi < orderings.size(); oi++) {
+            List<Boolean> ordering = orderings.get(oi);
+            LOGGER.info("Trying ordering {}/{}: {}", oi + 1, orderings.size(),
+                    orderingToString(ordering));
+            MergeTracer.trace("[INTERLEAVE] Trying ordering " + (oi + 1) + "/" + orderings.size()
+                    + ": " + orderingToString(ordering));
+
+            // Copy base dir to fresh temp dir for this ordering
+            Path tryDir = GitStateLoader.createTempDir("interleave-try-");
+            copyDirectory(baseDir, tryDir);
+
+            SemanticMergeResult result = tryInterleaving(
+                    tryDir, aTransactions, bTransactions, ordering,
+                    aDtos, bDtos, baseUuidToElement);
+
+            if (result.isSuccess()) {
+                List<MergeConflict> indirectInResult = result.getWarnings().stream()
+                        .filter(w -> w.getType() == MergeConflict.ConflictType.INDIRECT_CONFLICT)
+                        .toList();
+
+                if (indirectInResult.isEmpty()) {
+                    LOGGER.info("Found clean interleaving at ordering {}/{}", oi + 1, orderings.size());
+                    MergeTracer.trace("[INTERLEAVE] Clean ordering found at attempt " + (oi + 1));
+                    // Return success with INTERLEAVED direction
+                    return SemanticMergeResult.success(
+                            result.getAppliedChanges(),
+                            result.getWarnings(),
+                            result.getMergedStateFolder(),
+                            SemanticMergeResult.MergeDirection.INTERLEAVED);
+                }
+
+                int conflictCount = indirectInResult.size();
+                if (conflictCount < bestConflictCount) {
+                    bestConflictCount = conflictCount;
+                    bestResult = result;
+                }
+            }
+        }
+
+        // No ordering found — escalate to INTERLEAVING_CONFLICT
+        LOGGER.warn("No clean interleaving found — escalating to INTERLEAVING_CONFLICT");
+        MergeTracer.trace("[INTERLEAVE] No clean ordering found → INTERLEAVING_CONFLICT");
+
+        // Collect all indirect conflicts from the best attempt (for reporting)
+        List<MergeConflict> interleavingConflicts = new ArrayList<>();
+        if (bestResult != null) {
+            for (MergeConflict w : bestResult.getWarnings()) {
+                if (w.getType() == MergeConflict.ConflictType.INDIRECT_CONFLICT
+                        || w.getType() == MergeConflict.ConflictType.BIDIRECTIONAL_INDIRECT_CONFLICT) {
+                    interleavingConflicts.add(new MergeConflict(
+                            w.getElementId(),
+                            MergeConflict.ConflictType.INTERLEAVING_CONFLICT,
+                            w.getElementUuid(), w.getConflictingFeature(),
+                            w.getBaseValue(), w.getOursValue(), w.getTheirsValue()));
+                }
+            }
+        }
+        if (interleavingConflicts.isEmpty()) {
+            interleavingConflicts.add(new MergeConflict(
+                    "unknown", MergeConflict.ConflictType.INTERLEAVING_CONFLICT,
+                    null, null, null, null, null));
+        }
+        return SemanticMergeResult.conflict(interleavingConflicts);
+    }
+
+    /**
+     * Tries one specific commit ordering from the base state.
+     *
+     * <p>Takes a fresh copy of the base VSUM and replays commits from A and B
+     * in the order specified by {@code ordering}. Tracks which footprints belong
+     * to A vs B for dynamic indirect conflict detection.
+     *
+     * @param baseWorkDir       a copy of the base state directory (will be modified by replay)
+     * @param aTransactions     per-commit DTOs from branch A (in commit order)
+     * @param bTransactions     per-commit DTOs from branch B (in commit order)
+     * @param ordering          list of booleans: true=take from A, false=take from B
+     * @param allADtos          all A DTOs flat (for footprint collection)
+     * @param allBDtos          all B DTOs flat (for footprint collection)
+     * @param baseUuidToElement base state element map (for warning detection)
+     * @return merge result for this ordering
+     */
+    private SemanticMergeResult tryInterleaving(
+            Path baseWorkDir,
+            List<List<SemanticChangeLog.ChangeDto>> aTransactions,
+            List<List<SemanticChangeLog.ChangeDto>> bTransactions,
+            List<Boolean> ordering,
+            List<SemanticChangeLog.ChangeDto> allADtos,
+            List<SemanticChangeLog.ChangeDto> allBDtos,
+            Map<String, EObject> baseUuidToElement) throws IOException {
+
+        String uriPrefix = org.eclipse.emf.common.util.URI.createFileURI(
+                baseWorkDir.toAbsolutePath().toString()).toString();
+
+        // Load VSUM from base state
+        InternalVirtualModel vsum = GitStateLoader.loadVsumFromDir(baseWorkDir, specs, interactionProvider);
+
+        List<EChange<HierarchicalId>> allApplied = new ArrayList<>();
+        List<MergeConflict> indirectConflicts = new ArrayList<>();
+        List<MergeConflict> warnings = new ArrayList<>();
+
+        // Dynamic footprint tracking: which footprints have been replayed from A vs B so far
+        Set<String> aFootprintsSoFar = new HashSet<>();
+        Set<String> bFootprintsSoFar = new HashSet<>();
+
+        int aIdx = 0, bIdx = 0;
+
+        try {
+            for (int step = 0; step < ordering.size(); step++) {
+                boolean fromA = ordering.get(step);
+                List<SemanticChangeLog.ChangeDto> txnDtos;
+                Set<String> otherBranchFootprintsSoFar;
+
+                if (fromA) {
+                    if (aIdx >= aTransactions.size()) continue;
+                    txnDtos = aTransactions.get(aIdx++);
+                    otherBranchFootprintsSoFar = new HashSet<>(bFootprintsSoFar);
+                } else {
+                    if (bIdx >= bTransactions.size()) continue;
+                    txnDtos = bTransactions.get(bIdx++);
+                    otherBranchFootprintsSoFar = new HashSet<>(aFootprintsSoFar);
+                }
+
+                if (txnDtos.isEmpty()) continue;
+
+                // Update the running footprint set for the current branch
+                Set<String> txnFootprints = collectUuidFootprints(txnDtos);
+                if (fromA) {
+                    aFootprintsSoFar.addAll(txnFootprints);
+                } else {
+                    bFootprintsSoFar.addAll(txnFootprints);
+                }
+
+                Map<String, EObject> uuidToElement = buildUuidMap(vsum);
+
+                // USER_VS_DERIVED_WARNING: if this txn's user changes touch elements whose
+                // current state was derived by the OTHER branch's already-replayed commits
+                warnings.addAll(detectUserVsDerivedWarnings(
+                        txnDtos, otherBranchFootprintsSoFar, uuidToElement, baseUuidToElement));
+
+                // Snapshot other-branch footprint values BEFORE replay
+                Map<String, Object> preReplayValues = snapshotUserFootprintValues(
+                        otherBranchFootprintsSoFar, uuidToElement);
+
+                // Build synthetic DTO list from the other-branch footprint set for conflict detection
+                List<SemanticChangeLog.ChangeDto> otherDtos = new ArrayList<>();
+                for (String fp : otherBranchFootprintsSoFar) {
+                    String[] parts = fp.split("#", 2);
+                    SemanticChangeLog.ChangeDto d = new SemanticChangeLog.ChangeDto();
+                    d.affectedElementUuid = parts[0];
+                    d.featureName = parts.length > 1 ? parts[1] : null;
+                    otherDtos.add(d);
+                }
+
+                // Deserialize and replay
+                ChangeDtoDeserializer deserializer = new ChangeDtoDeserializer(null, uriPrefix);
+                List<EChange<HierarchicalId>> txnChanges = deserializer.deserializeAll(txnDtos);
+                if (txnChanges.isEmpty()) continue;
+
+                DerivedChangeCapture derivedCapture = new DerivedChangeCapture();
+                vsum.addChangePropagationListener(derivedCapture);
+
+                replayChanges(vsum, txnChanges);
+
+                vsum.removeChangePropagationListener(derivedCapture);
+                allApplied.addAll(txnChanges);
+
+                // Detect indirect conflicts: derived(replay(this txn)) vs user(other branch so far)
+                List<MergeConflict> txnIndirect = detectIndirectConflicts(
+                        derivedCapture.getDerivedChanges(), otherDtos, vsum.getUuidResolver());
+
+                // Snapshot-based detection
+                Set<String> thisTxnDirectFootprints = collectUuidFootprints(txnDtos);
+                Map<String, EObject> postReplayMap = buildUuidMap(vsum);
+                txnIndirect.addAll(detectIndirectConflictsViaSnapshot(
+                        preReplayValues, otherBranchFootprintsSoFar,
+                        thisTxnDirectFootprints, postReplayMap));
+
+                // Deduplicate
+                Set<String> seen = new HashSet<>();
+                for (MergeConflict ic : txnIndirect) {
+                    String key = ic.getElementUuid() + "#" + ic.getConflictingFeature();
+                    if (seen.add(key)) {
+                        indirectConflicts.add(ic);
+                    }
+                }
+
+                LOGGER.debug("Step {}: replayed {} changes from {}, {} indirect conflicts so far",
+                        step + 1, txnChanges.size(), fromA ? "A" : "B", indirectConflicts.size());
+            }
+        } catch (Exception e) {
+            LOGGER.error("Interleaving replay failed: {}", e.getMessage(), e);
+            vsum.dispose();
+            throw new IOException("Interleaving replay failed", e);
+        }
+
+        vsum.dispose();
+
+        List<MergeConflict> allWarnings = new ArrayList<>(warnings);
+        allWarnings.addAll(indirectConflicts);
+
+        return SemanticMergeResult.success(allApplied, allWarnings, baseWorkDir);
+    }
+
+    /**
+     * Copies a directory recursively from {@code source} to {@code target}.
+     * Used to clone the base state for each interleaving candidate.
+     */
+    private static void copyDirectory(Path source, Path target) throws IOException {
+        try (var walk = Files.walk(source)) {
+            for (Path src : walk.toList()) {
+                Path dest = target.resolve(source.relativize(src));
+                if (Files.isDirectory(src)) {
+                    Files.createDirectories(dest);
+                } else {
+                    Files.copy(src, dest);
+                }
+            }
+        }
+    }
+
+    /**
+     * Formats an interleaving ordering as a compact string for trace output.
+     * e.g., [A, B, A, A, B]
+     */
+    private static String orderingToString(List<Boolean> ordering) {
+        return ordering.stream()
+                .map(b -> b ? "A" : "B")
+                .collect(Collectors.joining(", ", "[", "]"));
+    }
+
+
     public SemanticMergeResult merge(String baseSha, String oursSha, String theirsSha)
             throws IOException, GitAPIException {
 
@@ -983,6 +1295,8 @@ public class SemanticMergeEngine {
                     + (conflict.getTheirsValue() != null ? " → " + conflict.getTheirsValue() : "");
             case BIDIRECTIONAL_INDIRECT_CONFLICT -> "BIDIRECTIONAL_INDIRECT_CONFLICT on feature '"
                     + conflict.getConflictingFeature() + "': both directions have indirect conflicts";
+            case INTERLEAVING_CONFLICT -> "INTERLEAVING_CONFLICT on feature '"
+                    + conflict.getConflictingFeature() + "': no commit ordering avoids indirect conflicts";
         };
     }
 

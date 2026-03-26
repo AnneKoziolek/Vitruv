@@ -26,7 +26,9 @@ public class MergeConflict {
         /** User change from A overwrites derived state on B — non-blocking warning. */
         USER_VS_DERIVED_WARNING,
         /** Both merge directions produce indirect conflicts — true semantic conflict. */
-        BIDIRECTIONAL_INDIRECT_CONFLICT
+        BIDIRECTIONAL_INDIRECT_CONFLICT,
+        /** No commit interleaving was found that avoids indirect conflicts — true semantic conflict. */
+        INTERLEAVING_CONFLICT
     }
 
     private final String elementId;

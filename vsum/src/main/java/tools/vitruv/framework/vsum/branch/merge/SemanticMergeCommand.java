@@ -140,4 +140,64 @@ public class SemanticMergeCommand {
         LOGGER.info("Bidirectional merge result: {}", result);
         return result;
     }
+
+    /**
+     * Executes an interleaving semantic merge between two branches.
+     *
+     * <p>Instead of replaying all commits from one branch onto the other,
+     * this method tries different interleavings of commits from both branches
+     * starting from the common base. The first interleaving that produces no
+     * indirect conflicts is used.
+     *
+     * <p>If no interleaving avoids indirect conflicts, returns a conflict result
+     * with type {@link MergeConflict.ConflictType#INTERLEAVING_CONFLICT}.
+     *
+     * @param repoRoot      the Git repository root
+     * @param branchA       first branch name
+     * @param branchB       second branch name
+     * @param specs         the change propagation specifications
+     * @param interactionProvider user interaction provider for VSUM creation
+     * @param conflictResolutionProvider optional provider for resolving direct conflicts
+     * @return the merge result with direction INTERLEAVED if successful
+     */
+    public SemanticMergeResult executeWithInterleaving(
+            Path repoRoot,
+            String branchA,
+            String branchB,
+            Collection<ChangePropagationSpecification> specs,
+            InteractionResultProvider interactionProvider,
+            ConflictResolutionProvider conflictResolutionProvider) throws Exception {
+
+        LOGGER.info("Interleaving semantic merge: {} <-> {}", branchA, branchB);
+
+        String branchASha;
+        String branchBSha;
+        try (Git git = Git.open(repoRoot.toFile())) {
+            Ref refA = git.getRepository().findRef(branchA);
+            Ref refB = git.getRepository().findRef(branchB);
+
+            if (refA == null) {
+                throw new IOException("Cannot resolve branch: " + branchA);
+            }
+            if (refB == null) {
+                throw new IOException("Cannot resolve branch: " + branchB);
+            }
+
+            branchASha = refA.getObjectId().getName();
+            branchBSha = refB.getObjectId().getName();
+        }
+
+        GitStateLoader loader = new GitStateLoader(repoRoot);
+        String baseSha = loader.findMergeBase(branchASha, branchBSha);
+        if (baseSha == null) {
+            throw new IOException("No common ancestor between " + branchA + " and " + branchB);
+        }
+
+        SemanticMergeEngine engine = new SemanticMergeEngine(
+                repoRoot, specs, interactionProvider, conflictResolutionProvider);
+        SemanticMergeResult result = engine.mergeWithInterleaving(baseSha, branchASha, branchBSha);
+
+        LOGGER.info("Interleaving merge result: {}", result);
+        return result;
+    }
 }
