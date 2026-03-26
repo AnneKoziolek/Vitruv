@@ -388,6 +388,16 @@ public class SemanticMergeEngine {
                     tryDir, aTransactions, bTransactions, ordering,
                     aDtos, bDtos, baseUuidToElement);
 
+            // Guard failure: the graph-proposed ordering makes some commit inapplicable.
+            // Fall back to exhaustive enumeration which will skip all inapplicable orderings.
+            if (replayResult.inapplicable()) {
+                LOGGER.warn("[INTERLEAVE] Graph-proposed ordering is inapplicable (guard failure) "
+                        + "— falling back to enumeration");
+                MergeTracer.trace("[INTERLEAVE] Guard failure → enumeration fallback");
+                return mergeWithInterleavingEnumeration(baseDir, aTransactions, bTransactions,
+                        aDtos, bDtos, baseUuidToElement, m, n);
+            }
+
             // Check if actual reaction footprints add new entries (monotone union)
             boolean fixedPoint = true;
             for (int i = 0; i < m; i++) {
@@ -440,11 +450,18 @@ public class SemanticMergeEngine {
                 MergeConflict.ConflictType.INTERLEAVING_CONFLICT, null, null, null, null, null)));
     }
 
-    /** Result of a single interleaving attempt, including per-commit actual reaction footprints. */
+    /**
+     * Result of a single interleaving attempt, including per-commit actual reaction footprints.
+     *
+     * @param inapplicable true if at least one commit in this ordering failed to apply (guard
+     *                     failure / element not found). The result field is not meaningful in
+     *                     that case. The ordering should be discarded and another tried.
+     */
     private record InterleavingReplayResult(
             SemanticMergeResult result,
             Map<Integer, Set<String>> actualAReactionFP,
-            Map<Integer, Set<String>> actualBReactionFP
+            Map<Integer, Set<String>> actualBReactionFP,
+            boolean inapplicable
     ) {}
 
     private InterleavingReplayResult tryInterleavingWithFootprintCapture(
@@ -560,9 +577,11 @@ public class SemanticMergeEngine {
                         step + 1, txnChanges.size(), fromA ? "A" : "B", indirectConflicts.size());
             }
         } catch (Exception e) {
-            LOGGER.error("Interleaving replay failed: {}", e.getMessage(), e);
+            LOGGER.warn("[INTERLEAVE] Ordering {} is inapplicable (guard failure): {}",
+                    orderingToString(ordering), e.getMessage());
+            LOGGER.debug("[INTERLEAVE] Guard failure details", e);
             vsum.dispose();
-            throw new IOException("Interleaving replay failed", e);
+            return new InterleavingReplayResult(null, actualAReactionFP, actualBReactionFP, true);
         }
 
         vsum.dispose();
@@ -571,7 +590,7 @@ public class SemanticMergeEngine {
         allWarnings.addAll(indirectConflicts);
 
         SemanticMergeResult result = SemanticMergeResult.success(allApplied, allWarnings, baseWorkDir);
-        return new InterleavingReplayResult(result, actualAReactionFP, actualBReactionFP);
+        return new InterleavingReplayResult(result, actualAReactionFP, actualBReactionFP, false);
     }
 
     private SemanticMergeResult mergeWithInterleavingEnumeration(
@@ -604,6 +623,13 @@ public class SemanticMergeEngine {
             SemanticMergeResult result = tryInterleaving(
                     tryDir, aTransactions, bTransactions, ordering,
                     aDtos, bDtos, baseUuidToElement);
+
+            if (result == null) {
+                // Guard failure: this ordering makes some commit inapplicable — skip it
+                LOGGER.info("[FALLBACK] Ordering {}/{} is inapplicable — skipping", oi + 1, orderings.size());
+                MergeTracer.trace("[FALLBACK] Ordering " + (oi + 1) + " inapplicable (guard failure) — skipped");
+                continue;
+            }
 
             if (result.isSuccess()) {
                 List<MergeConflict> indirectInResult = result.getWarnings().stream()
@@ -783,9 +809,11 @@ public class SemanticMergeEngine {
                         step + 1, txnChanges.size(), fromA ? "A" : "B", indirectConflicts.size());
             }
         } catch (Exception e) {
-            LOGGER.error("Interleaving replay failed: {}", e.getMessage(), e);
+            LOGGER.warn("[FALLBACK] Ordering {} is inapplicable (guard failure): {}",
+                    orderingToString(ordering), e.getMessage());
+            LOGGER.debug("[FALLBACK] Guard failure details", e);
             vsum.dispose();
-            throw new IOException("Interleaving replay failed", e);
+            return null; // signal: this ordering is inapplicable; caller should try next
         }
 
         vsum.dispose();
