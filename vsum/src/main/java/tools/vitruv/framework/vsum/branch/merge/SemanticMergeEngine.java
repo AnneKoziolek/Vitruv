@@ -1461,12 +1461,20 @@ public class SemanticMergeEngine {
 
     /**
      * Collects UUID#feature footprints from changelog DTOs.
+     * Also includes cascade-deleted child UUIDs as wildcard footprints (UUID without feature)
+     * so that any modification to a cascade-deleted child is detected as a conflict.
      */
     private Set<String> collectUuidFootprints(List<SemanticChangeLog.ChangeDto> dtos) {
         Set<String> footprints = new HashSet<>();
         for (SemanticChangeLog.ChangeDto dto : dtos) {
             if (dto.affectedElementUuid != null && dto.featureName != null) {
                 footprints.add(dto.affectedElementUuid + "#" + dto.featureName);
+            }
+            // Cascade-deleted children: add their UUIDs as footprints
+            if (dto.cascadeDeletedUuids != null) {
+                for (String childUuid : dto.cascadeDeletedUuids) {
+                    footprints.add(childUuid + "#*");
+                }
             }
         }
         return footprints;

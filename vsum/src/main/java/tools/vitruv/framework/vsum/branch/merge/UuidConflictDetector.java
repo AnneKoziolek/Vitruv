@@ -131,8 +131,13 @@ public class UuidConflictDetector {
 
     /**
      * Extracts UUIDs of elements deleted by this branch's changes.
-     * Includes both explicit DeleteEObject and RemoveEReference/RemoveRootEObject
-     * (which represent removal from containment — semantically a deletion).
+     * Includes:
+     * <ul>
+     *   <li>Explicit {@code DeleteEObject} changes</li>
+     *   <li>{@code RemoveEReference} / {@code RemoveRootEObject} (containment removal = semantic deletion)</li>
+     *   <li>Cascade-deleted children: UUIDs from {@code cascadeDeletedUuids} on each DTO,
+     *       populated at changelog capture time by walking the containment tree</li>
+     * </ul>
      */
     private Set<String> extractDeletedUuids(List<ChangeDto> dtos) {
         Set<String> deleted = new HashSet<>();
@@ -145,7 +150,6 @@ public class UuidConflictDetector {
             // The oldValueId contains the HierarchicalId of the removed element —
             // we need to find its UUID from other DTOs in the same changelog.
             if ("RemoveEReference".equals(dto.changeType) && dto.oldValueId != null) {
-                // Find the UUID of the removed element by matching HierarchicalId
                 for (ChangeDto other : dtos) {
                     if (other.affectedElementUuid != null
                             && other.affectedElementId != null
@@ -156,7 +160,6 @@ public class UuidConflictDetector {
                 }
             }
             if ("RemoveRootEObject".equals(dto.changeType) && dto.oldValueId != null) {
-                // Find UUID of the removed root by matching its HierarchicalId
                 for (ChangeDto other : dtos) {
                     if (other.affectedElementUuid != null
                             && other.affectedElementId != null
@@ -165,6 +168,12 @@ public class UuidConflictDetector {
                         break;
                     }
                 }
+            }
+            // Cascade-deleted children: when a parent is removed, EMF implicitly
+            // removes all contained children. Their UUIDs were captured at changelog
+            // capture time by walking eAllContents() of the removed element.
+            if (dto.cascadeDeletedUuids != null) {
+                deleted.addAll(dto.cascadeDeletedUuids);
             }
         }
         return deleted;

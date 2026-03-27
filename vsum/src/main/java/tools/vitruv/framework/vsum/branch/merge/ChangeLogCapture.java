@@ -56,6 +56,8 @@ public class ChangeLogCapture implements ChangePropagationListener {
     private final List<String> pendingUuidStrings = new ArrayList<>();
     /** Pre-captured UUID→HierarchicalId mappings for elements that may be deleted during propagation. */
     private final Map<Uuid, HierarchicalId> preCapturedIds = new HashMap<>();
+    /** Cascade-deleted child UUIDs: parentUuidString → list of child UUID strings. */
+    private final Map<String, List<String>> cascadeDeletedUuids = new HashMap<>();
 
     public ChangeLogCapture(UuidResolver uuidResolver, HierarchicalIdResolver hierarchicalIdResolver) {
         this.uuidResolver = uuidResolver;
@@ -70,6 +72,7 @@ public class ChangeLogCapture implements ChangePropagationListener {
     public void startedChangePropagation(VitruviusChange<Uuid> changeToPropagate) {
         pendingChange = changeToPropagate;
         preCapturedIds.clear();
+        cascadeDeletedUuids.clear();
         // Pre-capture UUID strings and UUID→HierarchicalId mappings from the input
         // (before reactions may modify or delete model elements).
         // This is critical for deletion changes: after propagation the deleted elements
@@ -88,6 +91,44 @@ public class ChangeLogCapture implements ChangePropagationListener {
                             uuid, e.getMessage());
                 }
             });
+
+            // For removal changes, walk the removed element's containment tree to capture
+            // cascade-deleted child UUIDs. When a parent is removed from its containment
+            // reference, EMF implicitly removes all contained children. These children's
+            // UUIDs are NOT recorded as separate changes, so we must capture them here.
+            if (change instanceof tools.vitruv.change.atomic.eobject.EObjectSubtractedEChange<Uuid> sc
+                    && sc.getOldValue() != null) {
+                Uuid removedUuid = sc.getOldValue();
+                try {
+                    EObject removedObj = uuidResolver.getEObject(removedUuid);
+                    if (removedObj != null) {
+                        List<String> childUuids = new ArrayList<>();
+                        removedObj.eAllContents().forEachRemaining(child -> {
+                            try {
+                                var childUuid = uuidResolver.getUuid(child);
+                                if (childUuid != null) {
+                                    childUuids.add(childUuid.toString());
+                                    // Also pre-capture the child's HierarchicalId
+                                    HierarchicalId childHid =
+                                            hierarchicalIdResolver.getAndUpdateId(child);
+                                    preCapturedIds.put(childUuid, childHid);
+                                }
+                            } catch (Exception e) {
+                                LOGGER.debug("Could not capture cascade child UUID: {}",
+                                        e.getMessage());
+                            }
+                        });
+                        if (!childUuids.isEmpty()) {
+                            cascadeDeletedUuids.put(removedUuid.toString(), childUuids);
+                            LOGGER.debug("Captured {} cascade-deleted child UUIDs for parent {}",
+                                    childUuids.size(), removedUuid);
+                        }
+                    }
+                } catch (Exception e) {
+                    LOGGER.debug("Could not walk containment tree for UUID {}: {}",
+                            removedUuid, e.getMessage());
+                }
+            }
         }
     }
 
@@ -116,6 +157,8 @@ public class ChangeLogCapture implements ChangePropagationListener {
             pendingChange = null;
             pendingUuidStrings.clear();
             preCapturedIds.clear();
+            // Note: cascadeDeletedUuids is NOT cleared here — it is drained
+            // by drainCascadeDeletedUuids() alongside drainChanges().
         }
     }
 
@@ -132,6 +175,17 @@ public class ChangeLogCapture implements ChangePropagationListener {
     public Map<String, String> drainUuidMapping() {
         Map<String, String> result = new HashMap<>(uuidToHidMapping);
         uuidToHidMapping.clear();
+        return result;
+    }
+
+    /**
+     * Returns the cascade-deleted UUIDs accumulated during capture.
+     * Maps parent UUID string → list of child UUID strings for elements that are
+     * implicitly removed when the parent is deleted from its containment reference.
+     */
+    public Map<String, List<String>> drainCascadeDeletedUuids() {
+        Map<String, List<String>> result = new HashMap<>(cascadeDeletedUuids);
+        cascadeDeletedUuids.clear();
         return result;
     }
 

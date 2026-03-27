@@ -54,19 +54,29 @@ public class SemanticChangeLog {
     private final String branch;
     private final List<EChange<HierarchicalId>> primaryChanges;
     private final Map<String, String> uuidMappings; // uuid → hierarchicalId
+    private final Map<String, List<String>> cascadeDeletedUuids; // parentUuid → [childUuids]
 
     public SemanticChangeLog(String commitSha, String branch,
                              List<EChange<HierarchicalId>> primaryChanges) {
-        this(commitSha, branch, primaryChanges, Map.of());
+        this(commitSha, branch, primaryChanges, Map.of(), Map.of());
     }
 
     public SemanticChangeLog(String commitSha, String branch,
                              List<EChange<HierarchicalId>> primaryChanges,
                              Map<String, String> uuidMappings) {
+        this(commitSha, branch, primaryChanges, uuidMappings, Map.of());
+    }
+
+    public SemanticChangeLog(String commitSha, String branch,
+                             List<EChange<HierarchicalId>> primaryChanges,
+                             Map<String, String> uuidMappings,
+                             Map<String, List<String>> cascadeDeletedUuids) {
         this.commitSha = Objects.requireNonNull(commitSha, "commitSha must not be null");
         this.branch = Objects.requireNonNull(branch, "branch must not be null");
         this.primaryChanges = Collections.unmodifiableList(new ArrayList<>(primaryChanges));
         this.uuidMappings = Map.copyOf(uuidMappings);
+        this.cascadeDeletedUuids = cascadeDeletedUuids != null
+                ? Map.copyOf(cascadeDeletedUuids) : Map.of();
     }
 
     public String getCommitSha() { return commitSha; }
@@ -151,6 +161,11 @@ public class SemanticChangeLog {
                     }
                 }
             }
+            // Enrich with cascade-deleted UUIDs if this DTO's UUID has cascade children
+            if (dto.affectedElementUuid != null
+                    && cascadeDeletedUuids.containsKey(dto.affectedElementUuid)) {
+                dto.cascadeDeletedUuids = cascadeDeletedUuids.get(dto.affectedElementUuid);
+            }
             dtos.add(dto);
         }
         ChangeLogDto logDto = new ChangeLogDto();
@@ -190,6 +205,14 @@ public class SemanticChangeLog {
         public int index = -1;
         public String resourceUri;
         public String affectedEObjectType;
+        /**
+         * UUIDs of all contained children that are implicitly cascade-deleted when
+         * this element is removed from its containment reference. Populated at changelog
+         * capture time by walking {@code eAllContents()} of the removed element.
+         * Used by {@link UuidConflictDetector} to detect conflicts on child elements.
+         * Null if this change is not a removal or the element has no children.
+         */
+        public List<String> cascadeDeletedUuids;
 
         @SuppressWarnings("unchecked")
         public static ChangeDto fromEChange(EChange<HierarchicalId> change) {
