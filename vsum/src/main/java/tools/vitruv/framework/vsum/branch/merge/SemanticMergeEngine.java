@@ -1294,6 +1294,19 @@ public class SemanticMergeEngine {
      * Applies a deserialized EChange to the view's model using EMF's reflective API.
      * Direct calls to eSet/eGet/list.add trigger proper EMF notifications that the
      * ChangeRecorder captures (unlike ApplyEChangeSwitch which uses EditingDomain Commands).
+     *
+     * <h4>Deletion handling</h4>
+     * <ul>
+     *   <li>{@code DeleteEObject}: Tolerates already-removed elements (returns silently).
+     *       This happens when a prior {@code RemoveEReference} in the same transaction
+     *       already detached the element from the containment tree.</li>
+     *   <li>{@code RemoveEReference}: Tolerates unresolvable containers (logs and returns).
+     *       The container may have been deleted by a cascade or prior change.</li>
+     *   <li>{@code ReplaceSingleValuedEAttribute}: Throws {@link IllegalStateException}
+     *       if the target element cannot be resolved — this is a guard failure indicating
+     *       the element was deleted on the target branch. The caller catches this and
+     *       reports a {@link MergeConflict.ConflictType#REPLAY_APPLICABILITY} conflict.</li>
+     * </ul>
      */
     @SuppressWarnings("unchecked")
     private static void applyChangeReflectively(EChange<HierarchicalId> eChange,

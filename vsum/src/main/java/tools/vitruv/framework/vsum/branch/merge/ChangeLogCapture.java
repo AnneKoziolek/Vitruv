@@ -28,6 +28,20 @@ import tools.vitruv.change.composite.propagation.ChangePropagationListener;
  *
  * <p>Conversion happens in {@code finishedChangePropagation()} (after changes applied)
  * because newly created objects don't have UUID→EObject mappings until after application.
+ *
+ * <h3>Deletion handling</h3>
+ * When an element is deleted (removed from its containment reference), EMF removes
+ * it from the model during propagation. After that, the {@link UuidResolver} can no
+ * longer resolve the element's UUID to an EObject, so the normal Uuid→EObject→HierarchicalId
+ * conversion path in {@code finishedChangePropagation()} would fail and the deletion
+ * changes would be silently dropped from the changelog.
+ *
+ * <p>To handle this, {@code startedChangePropagation()} <b>pre-captures</b> UUID→HierarchicalId
+ * mappings for all elements referenced by the incoming changes (while they still exist
+ * in the model). The conversion in {@code finishedChangePropagation()} then falls back to
+ * these pre-captured IDs when normal resolution fails. This ensures that deletion changes
+ * ({@code RemoveEReference}, {@code DeleteEObject}, {@code RemoveRootEObject}) are properly
+ * recorded in the changelog with correct HierarchicalIds.
  */
 public class ChangeLogCapture implements ChangePropagationListener {
 

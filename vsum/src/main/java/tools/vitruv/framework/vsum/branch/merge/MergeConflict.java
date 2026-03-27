@@ -11,6 +11,13 @@ import tools.vitruv.change.atomic.hid.HierarchicalId;
  * Represents a semantic conflict detected during three-way merge.
  * A conflict occurs when both branches modify the same model element
  * (identified by UUID) in incompatible ways since the common ancestor.
+ *
+ * <p>Conflict types include modification conflicts ({@link ConflictType#MODIFY_MODIFY}),
+ * deletion conflicts ({@link ConflictType#DELETE_MODIFY}, {@link ConflictType#MODIFY_DELETE}),
+ * indirect/derived conflicts ({@link ConflictType#INDIRECT_CONFLICT},
+ * {@link ConflictType#BIDIRECTIONAL_INDIRECT_CONFLICT}, {@link ConflictType#INTERLEAVING_CONFLICT}),
+ * non-blocking warnings ({@link ConflictType#USER_VS_DERIVED_WARNING}),
+ * and replay failures ({@link ConflictType#REPLAY_APPLICABILITY}).
  */
 public class MergeConflict {
 
@@ -29,7 +36,14 @@ public class MergeConflict {
         BIDIRECTIONAL_INDIRECT_CONFLICT,
         /** No commit interleaving was found that avoids indirect conflicts — true semantic conflict. */
         INTERLEAVING_CONFLICT,
-        /** Replay failed because the target element no longer exists (e.g., deleted or cascade-deleted). */
+        /**
+         * Replay failed because a target element no longer exists (e.g., deleted or
+         * cascade-deleted on the target branch). This is a runtime-detected conflict:
+         * the static UUID-based detection in {@link UuidConflictDetector} did not catch
+         * the conflict (e.g., because the deletion was a cascade from a parent element
+         * whose UUID differs from the modified child's UUID). The directed merge catches
+         * the replay exception and reports this conflict type instead of crashing.
+         */
         REPLAY_APPLICABILITY
     }
 

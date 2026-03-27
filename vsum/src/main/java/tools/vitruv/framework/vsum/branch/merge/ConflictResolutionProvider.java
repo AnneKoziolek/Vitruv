@@ -5,6 +5,17 @@ import java.util.List;
 /**
  * Strategy for resolving merge conflicts.
  * Receives a list of conflicts and returns resolutions (ours or theirs per conflict).
+ *
+ * <p>For {@link MergeConflict.ConflictType#MODIFY_MODIFY} conflicts, OURS keeps the
+ * target branch's value for the conflicting feature; THEIRS accepts the source branch's value.
+ *
+ * <p>For deletion conflicts ({@link MergeConflict.ConflictType#DELETE_MODIFY} and
+ * {@link MergeConflict.ConflictType#MODIFY_DELETE}), OURS/THEIRS applies to the entire
+ * element, not a single feature. Choosing OURS for a DELETE_MODIFY conflict keeps the
+ * target branch's state (element deleted); choosing THEIRS keeps the source branch's
+ * modification (element preserved). The {@code filterByResolutions()} method in
+ * {@link SemanticMergeEngine} filters by UUID only (not UUID+feature) for delete
+ * conflicts, dropping all DTOs for the resolved element.
  */
 @FunctionalInterface
 public interface ConflictResolutionProvider {
