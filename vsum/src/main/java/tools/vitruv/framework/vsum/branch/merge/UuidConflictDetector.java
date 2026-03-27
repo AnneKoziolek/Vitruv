@@ -131,12 +131,40 @@ public class UuidConflictDetector {
 
     /**
      * Extracts UUIDs of elements deleted by this branch's changes.
+     * Includes both explicit DeleteEObject and RemoveEReference/RemoveRootEObject
+     * (which represent removal from containment — semantically a deletion).
      */
     private Set<String> extractDeletedUuids(List<ChangeDto> dtos) {
         Set<String> deleted = new HashSet<>();
         for (ChangeDto dto : dtos) {
-            if (dto.affectedElementUuid != null && "DeleteEObject".equals(dto.changeType)) {
+            if (dto.affectedElementUuid == null) continue;
+            if ("DeleteEObject".equals(dto.changeType)) {
                 deleted.add(dto.affectedElementUuid);
+            }
+            // RemoveEReference from a containment feature removes the child element.
+            // The oldValueId contains the HierarchicalId of the removed element —
+            // we need to find its UUID from other DTOs in the same changelog.
+            if ("RemoveEReference".equals(dto.changeType) && dto.oldValueId != null) {
+                // Find the UUID of the removed element by matching HierarchicalId
+                for (ChangeDto other : dtos) {
+                    if (other.affectedElementUuid != null
+                            && other.affectedElementId != null
+                            && other.affectedElementId.equals(dto.oldValueId)) {
+                        deleted.add(other.affectedElementUuid);
+                        break;
+                    }
+                }
+            }
+            if ("RemoveRootEObject".equals(dto.changeType) && dto.oldValueId != null) {
+                // Find UUID of the removed root by matching its HierarchicalId
+                for (ChangeDto other : dtos) {
+                    if (other.affectedElementUuid != null
+                            && other.affectedElementId != null
+                            && other.affectedElementId.equals(dto.oldValueId)) {
+                        deleted.add(other.affectedElementUuid);
+                        break;
+                    }
+                }
             }
         }
         return deleted;

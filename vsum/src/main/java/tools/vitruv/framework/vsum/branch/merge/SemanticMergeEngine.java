@@ -9,6 +9,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -1152,9 +1153,30 @@ public class SemanticMergeEngine {
                         indirectConflicts.size(), warnings.size());
             }
         } catch (Exception e) {
-            LOGGER.error("Replay failed: {}", e.getMessage(), e);
+            LOGGER.warn("Replay failed (guard failure — element may have been deleted): {}",
+                    e.getMessage());
+            LOGGER.debug("Replay guard failure details", e);
             targetVsum.dispose();
-            throw new IOException("Semantic merge replay failed", e);
+
+            // Report as a replay-applicability conflict instead of crashing.
+            // This happens when the source branch modifies an element that was
+            // deleted on the target branch (or vice versa) and the conflict was
+            // not caught by static UUID-based detection (e.g., cascade deletions).
+            List<MergeConflict> replayConflicts = new ArrayList<>(conflicts.isEmpty()
+                    ? List.of() : conflicts);
+            replayConflicts.add(new MergeConflict(
+                    "replay-applicability",
+                    MergeConflict.ConflictType.REPLAY_APPLICABILITY,
+                    null, null, null, null,
+                    "Replay failed: " + e.getMessage()));
+            long totalNanos = System.nanoTime() - mergeStartNanos;
+            return SemanticMergeResult.conflict(replayConflicts)
+                    .withTimingStats(new SemanticMergeResult.TimingStats()
+                            .gitStateExtraction(gitStateExtractionNanos)
+                            .dtoLoading(dtoLoadingNanos)
+                            .conflictDetection(conflictDetectionNanos)
+                            .replay(System.nanoTime() - replayPhaseStart)
+                            .total(totalNanos));
         }
         replayPhaseNanos = System.nanoTime() - replayPhaseStart;
         LOGGER.info("[TIMING] Replay phase (all transactions): {} ms",
@@ -1291,19 +1313,42 @@ public class SemanticMergeEngine {
             }
 
         } else if (eChange instanceof tools.vitruv.change.atomic.feature.attribute.ReplaceSingleValuedEAttribute<HierarchicalId, ?> rsa) {
-            EObject element = idResolver.getEObject(rsa.getAffectedElement());
-            element.eSet(rsa.getAffectedFeature(), rsa.getNewValue());
+            try {
+                EObject element = idResolver.getEObject(rsa.getAffectedElement());
+                element.eSet(rsa.getAffectedFeature(), rsa.getNewValue());
+            } catch (Exception e) {
+                // Element may have been deleted on the target branch — rethrow as guard failure
+                throw new IllegalStateException("Cannot apply ReplaceSingleValuedEAttribute: "
+                        + "element not found for " + rsa.getAffectedElement(), e);
+            }
 
         } else if (eChange instanceof tools.vitruv.change.atomic.feature.reference.RemoveEReference<HierarchicalId> rr) {
-            EObject container = idResolver.getEObject(rr.getAffectedElement());
-            var list = (List<EObject>) container.eGet(rr.getAffectedFeature());
-            if (rr.getIndex() >= 0 && rr.getIndex() < list.size()) {
-                list.remove(rr.getIndex());
+            try {
+                EObject container = idResolver.getEObject(rr.getAffectedElement());
+                var list = (List<EObject>) container.eGet(rr.getAffectedFeature());
+                if (rr.getIndex() >= 0 && rr.getIndex() < list.size()) {
+                    list.remove(rr.getIndex());
+                }
+            } catch (Exception e) {
+                LOGGER.debug("RemoveEReference: container not resolvable (may be deleted): {}",
+                        rr.getAffectedElement());
             }
 
         } else if (eChange instanceof tools.vitruv.change.atomic.eobject.DeleteEObject<HierarchicalId> de) {
-            EObject element = idResolver.getEObject(de.getAffectedElement());
-            EcoreUtil.remove(element);
+            try {
+                EObject element = idResolver.getEObject(de.getAffectedElement());
+                if (element != null) {
+                    EcoreUtil.remove(element);
+                } else {
+                    LOGGER.debug("DeleteEObject: element already removed (null): {}",
+                            de.getAffectedElement());
+                }
+            } catch (Exception e) {
+                // Element may have been removed by a prior RemoveEReference in the same
+                // transaction (containment removal already detached it from the model).
+                LOGGER.debug("DeleteEObject: element not resolvable (already removed): {}",
+                        de.getAffectedElement());
+            }
 
         } else if (eChange instanceof tools.vitruv.change.atomic.feature.attribute.InsertEAttributeValue<HierarchicalId, ?> ia) {
             EObject element = idResolver.getEObject(ia.getAffectedElement());
@@ -1321,27 +1366,51 @@ public class SemanticMergeEngine {
      * Filters theirs' DTOs based on conflict resolutions.
      * For OURS choice: remove the conflicting theirs DTO.
      * For THEIRS choice: keep it (will be replayed).
+     *
+     * <p>For DELETE_MODIFY / MODIFY_DELETE conflicts, filtering is UUID-only
+     * (not UUID+feature) because a deletion affects all features of an element.
+     * When OURS is chosen for a delete conflict, ALL DTOs referencing the
+     * conflicting UUID are dropped (the entire deletion or modification group).
      */
     private List<SemanticChangeLog.ChangeDto> filterByResolutions(
             List<SemanticChangeLog.ChangeDto> theirsDtos,
             List<MergeConflict> conflicts,
             List<ConflictResolution> resolutions) {
 
+        // UUIDs where the user chose OURS — these theirs DTOs should be skipped
         Set<String> skipUuids = resolutions.stream()
                 .filter(r -> r.choice() == ConflictResolution.Choice.OURS)
                 .map(ConflictResolution::elementUuid)
                 .collect(Collectors.toSet());
 
+        // For MODIFY_MODIFY: filter by UUID+feature (only skip the conflicting feature)
         Map<String, String> conflictFeatures = conflicts.stream()
                 .filter(c -> c.getConflictingFeature() != null)
+                .filter(c -> c.getType() == MergeConflict.ConflictType.MODIFY_MODIFY)
                 .collect(Collectors.toMap(
                         c -> c.getElementUuid() + "#" + c.getConflictingFeature(),
                         c -> c.getConflictingFeature(),
                         (a, b) -> a));
 
+        // For DELETE_MODIFY / MODIFY_DELETE: filter by UUID only (skip all DTOs for that element)
+        Set<String> deleteConflictUuids = conflicts.stream()
+                .filter(c -> c.getType() == MergeConflict.ConflictType.DELETE_MODIFY
+                        || c.getType() == MergeConflict.ConflictType.MODIFY_DELETE)
+                .map(MergeConflict::getElementUuid)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+
         return theirsDtos.stream()
                 .filter(dto -> {
                     if (dto.affectedElementUuid == null) return true;
+
+                    // For delete conflicts resolved as OURS: skip ALL DTOs for this UUID
+                    if (deleteConflictUuids.contains(dto.affectedElementUuid)
+                            && skipUuids.contains(dto.affectedElementUuid)) {
+                        return false;
+                    }
+
+                    // For MODIFY_MODIFY conflicts resolved as OURS: skip only matching feature
                     String key = dto.affectedElementUuid + "#" + dto.featureName;
                     return !(conflictFeatures.containsKey(key)
                             && skipUuids.contains(dto.affectedElementUuid));
@@ -1683,6 +1752,8 @@ public class SemanticMergeEngine {
                     + conflict.getConflictingFeature() + "': both directions have indirect conflicts";
             case INTERLEAVING_CONFLICT -> "INTERLEAVING_CONFLICT on feature '"
                     + conflict.getConflictingFeature() + "': no commit ordering avoids indirect conflicts";
+            case REPLAY_APPLICABILITY -> "REPLAY_APPLICABILITY: replay failed — target element missing"
+                    + (conflict.getTheirsValue() != null ? " (" + conflict.getTheirsValue() + ")" : "");
         };
     }
 

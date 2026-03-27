@@ -40,6 +40,8 @@ public class ChangeLogCapture implements ChangePropagationListener {
 
     private VitruviusChange<Uuid> pendingChange;
     private final List<String> pendingUuidStrings = new ArrayList<>();
+    /** Pre-captured UUID→HierarchicalId mappings for elements that may be deleted during propagation. */
+    private final Map<Uuid, HierarchicalId> preCapturedIds = new HashMap<>();
 
     public ChangeLogCapture(UuidResolver uuidResolver, HierarchicalIdResolver hierarchicalIdResolver) {
         this.uuidResolver = uuidResolver;
@@ -53,10 +55,25 @@ public class ChangeLogCapture implements ChangePropagationListener {
     @Override
     public void startedChangePropagation(VitruviusChange<Uuid> changeToPropagate) {
         pendingChange = changeToPropagate;
-        // Pre-capture UUID strings from the input (before reactions may modify state)
+        preCapturedIds.clear();
+        // Pre-capture UUID strings and UUID→HierarchicalId mappings from the input
+        // (before reactions may modify or delete model elements).
+        // This is critical for deletion changes: after propagation the deleted elements
+        // are no longer resolvable, so we capture their IDs while they still exist.
         for (EChange<Uuid> change : changeToPropagate.getEChanges()) {
-            extractUuids(change).forEach(uuid ->
-                    pendingUuidStrings.add(uuid.toString()));
+            extractUuids(change).forEach(uuid -> {
+                pendingUuidStrings.add(uuid.toString());
+                try {
+                    EObject eObject = uuidResolver.getEObject(uuid);
+                    if (eObject != null) {
+                        HierarchicalId hid = hierarchicalIdResolver.getAndUpdateId(eObject);
+                        preCapturedIds.put(uuid, hid);
+                    }
+                } catch (Exception e) {
+                    LOGGER.debug("Could not pre-capture HierarchicalId for UUID {}: {}",
+                            uuid, e.getMessage());
+                }
+            });
         }
     }
 
@@ -84,6 +101,7 @@ public class ChangeLogCapture implements ChangePropagationListener {
         } finally {
             pendingChange = null;
             pendingUuidStrings.clear();
+            preCapturedIds.clear();
         }
     }
 
@@ -111,8 +129,23 @@ public class ChangeLogCapture implements ChangePropagationListener {
         return AtomicEChangeResolverHelper.resolveChange(
                 uuidChange,
                 uuid -> {
-                    EObject eObject = uuidResolver.getEObject(uuid);
-                    return hierarchicalIdResolver.getAndUpdateId(eObject);
+                    // Try normal resolution first (works for creates and modifications)
+                    try {
+                        EObject eObject = uuidResolver.getEObject(uuid);
+                        if (eObject != null) {
+                            return hierarchicalIdResolver.getAndUpdateId(eObject);
+                        }
+                    } catch (Exception e) {
+                        // Element may have been deleted during propagation — fall through
+                    }
+                    // Fall back to pre-captured ID (captured in startedChangePropagation
+                    // before the element was removed from the model)
+                    HierarchicalId preCaptured = preCapturedIds.get(uuid);
+                    if (preCaptured != null) {
+                        return preCaptured;
+                    }
+                    throw new IllegalStateException(
+                            "Cannot resolve UUID " + uuid + " — element deleted and no pre-captured ID");
                 },
                 resource -> resource
         );
@@ -120,25 +153,18 @@ public class ChangeLogCapture implements ChangePropagationListener {
 
     /**
      * Builds UUID→HierarchicalId mappings from pre-captured UUID strings.
-     * Tries to resolve each UUID to an EObject and compute its HierarchicalId.
+     * Uses pre-captured IDs (from startedChangePropagation) for elements
+     * that may have been deleted during propagation, and tries post-propagation
+     * resolution for elements that still exist (e.g., newly created ones).
      */
     private void buildUuidMappingFromStrings() {
-        for (String uuidStr : pendingUuidStrings) {
-            try {
-                // Find the Uuid object by trying to resolve it
-                // The UuidResolver stores Uuid→EObject mappings internally
-                // We iterate the captured HierarchicalId changes to build the mapping
-                // Since we already converted Uuid→HierarchicalId above, we can
-                // use the buffered changes to build the mapping
-            } catch (Exception e) {
-                // Some UUIDs may not resolve after reactions modify state
-            }
+        // First, add all pre-captured mappings (these are reliable for deleted elements)
+        for (var entry : preCapturedIds.entrySet()) {
+            uuidToHidMapping.put(entry.getKey().toString(), entry.getValue().getId());
         }
-        // Simpler approach: use the buffered HID changes + pending UUID strings
-        // to build the mapping by position correspondence
+
+        // Also build mapping from the successfully converted HID changes
         if (!pendingUuidStrings.isEmpty() && !bufferedChanges.isEmpty()) {
-            // The pending UUID strings correspond to the same elements as the buffered HID changes
-            // Build mapping from the successfully captured changes
             int hidIdx = bufferedChanges.size() - pendingUuidStrings.size();
             if (hidIdx < 0) hidIdx = 0;
             for (int i = 0; i < pendingUuidStrings.size() && (hidIdx + i) < bufferedChanges.size(); i++) {

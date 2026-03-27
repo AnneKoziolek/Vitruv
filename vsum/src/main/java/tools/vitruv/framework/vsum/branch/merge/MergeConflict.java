@@ -28,7 +28,9 @@ public class MergeConflict {
         /** Both merge directions produce indirect conflicts — true semantic conflict. */
         BIDIRECTIONAL_INDIRECT_CONFLICT,
         /** No commit interleaving was found that avoids indirect conflicts — true semantic conflict. */
-        INTERLEAVING_CONFLICT
+        INTERLEAVING_CONFLICT,
+        /** Replay failed because the target element no longer exists (e.g., deleted or cascade-deleted). */
+        REPLAY_APPLICABILITY
     }
 
     private final String elementId;
