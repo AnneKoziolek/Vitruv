@@ -37,6 +37,14 @@ import tools.vitruv.change.atomic.root.RootEChange;
  * HierarchicalId and UUID), feature names, and values. The DTOs are used both for UUID-based
  * conflict detection and for reconstructing live EChange objects via {@link ChangeDtoDeserializer}.
  *
+ * <p>In addition to per-change data, the changelog optionally stores
+ * <b>cascade-deleted child UUIDs</b> (via {@link ChangeDto#cascadeDeletedUuids}).
+ * When a parent element is removed from a containment reference, EMF implicitly deletes
+ * all contained children. Their UUIDs are captured by {@link ChangeLogCapture} at commit
+ * time and attached to the parent's removal DTO during serialization in {@link #saveTo(Path)}.
+ * This enables {@link UuidConflictDetector} to statically detect conflicts on
+ * cascade-deleted children whose UUIDs would otherwise not appear in the changelog.
+ *
  * <p>Note: XMI serialization was attempted but fails because the EChange Ecore metamodel
  * defines element references via generic {@code ETypeParameter} with bounds {@code EJavaObject},
  * preventing proper cross-reference serialization of HierarchicalId objects.

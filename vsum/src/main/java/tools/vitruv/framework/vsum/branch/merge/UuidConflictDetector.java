@@ -26,6 +26,20 @@ import tools.vitruv.framework.vsum.branch.merge.SemanticChangeLog.ChangeDto;
  *   <li>Both branches add new elements (different UUIDs) → NOT a conflict</li>
  *   <li>Both branches insert into the same list → NOT a conflict (additive)</li>
  * </ul>
+ *
+ * <h3>Deletion detection</h3>
+ * "Deleted" UUIDs are extracted from three sources:
+ * <ol>
+ *   <li><b>Explicit {@code DeleteEObject}</b> — the UUID is directly on the DTO.</li>
+ *   <li><b>{@code RemoveEReference} / {@code RemoveRootEObject}</b> — containment removal
+ *       is a semantic deletion. The removed child's UUID is found by matching the
+ *       {@code oldValueId} (HierarchicalId) against other DTOs in the same changelog.</li>
+ *   <li><b>Cascade-deleted children</b> — UUIDs from {@link SemanticChangeLog.ChangeDto#cascadeDeletedUuids},
+ *       populated at changelog capture time by {@link ChangeLogCapture} walking
+ *       {@code eAllContents()} of the removed element. This covers EMF containment
+ *       cascade: when a parent is removed, all children are implicitly deleted, but
+ *       their UUIDs differ from the parent's UUID and would otherwise go undetected.</li>
+ * </ol>
  */
 public class UuidConflictDetector {
 

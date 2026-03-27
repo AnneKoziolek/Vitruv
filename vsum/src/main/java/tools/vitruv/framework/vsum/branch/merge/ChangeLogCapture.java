@@ -42,6 +42,22 @@ import tools.vitruv.change.composite.propagation.ChangePropagationListener;
  * these pre-captured IDs when normal resolution fails. This ensures that deletion changes
  * ({@code RemoveEReference}, {@code DeleteEObject}, {@code RemoveRootEObject}) are properly
  * recorded in the changelog with correct HierarchicalIds.
+ *
+ * <h3>Cascade containment deletion tracking</h3>
+ * When an element is removed from a containment reference ({@code RemoveEReference} or
+ * {@code RemoveRootEObject}), EMF implicitly removes all its contained children. These
+ * children's UUIDs are <b>not</b> recorded as separate changes by the ChangeRecorder, so
+ * without additional tracking, conflicts on cascade-deleted children would go undetected
+ * (the parent's UUID differs from each child's UUID).
+ *
+ * <p>{@code startedChangePropagation()} detects removal changes (via
+ * {@link tools.vitruv.change.atomic.eobject.EObjectSubtractedEChange EObjectSubtractedEChange})
+ * and walks {@code eAllContents()} of the removed element to collect all descendant UUIDs.
+ * These are stored in the {@link #cascadeDeletedUuids} map (parent UUID → child UUIDs),
+ * drained via {@link #drainCascadeDeletedUuids()}, and attached to the corresponding
+ * {@link SemanticChangeLog.ChangeDto#cascadeDeletedUuids} field during changelog serialization.
+ * The {@link UuidConflictDetector} then includes these cascade UUIDs in the deleted set,
+ * enabling static conflict detection.
  */
 public class ChangeLogCapture implements ChangePropagationListener {
 
