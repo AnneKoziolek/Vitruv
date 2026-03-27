@@ -315,6 +315,8 @@ public class SemanticMergeEngine {
         }
 
         // Iterative fixpoint loop
+        // Runtime-discovered dependency edges from guard failures (carried across iterations)
+        List<int[]> runtimeEdges = new ArrayList<>();
         int maxIterations = m + n + 2;
         for (int iteration = 0; iteration < maxIterations; iteration++) {
             LOGGER.info("[INTERLEAVE] Iteration {} / {}", iteration + 1, maxIterations);
@@ -346,6 +348,11 @@ public class SemanticMergeEngine {
                         graph.addEdge(graph.nodeB(j), graph.nodeA(i));
                     }
                 }
+            }
+
+            // Add runtime-discovered dependency edges from prior guard failures
+            for (int[] edge : runtimeEdges) {
+                graph.addEdge(edge[0], edge[1]);
             }
 
             // Check for cycle
@@ -389,10 +396,41 @@ public class SemanticMergeEngine {
                     aDtos, bDtos, baseUuidToElement);
 
             // Guard failure: the graph-proposed ordering makes some commit inapplicable.
-            // Fall back to exhaustive enumeration which will skip all inapplicable orderings.
+            // Add the discovered dependency edge and retry instead of falling back to enumeration.
             if (replayResult.inapplicable()) {
-                LOGGER.warn("[INTERLEAVE] Graph-proposed ordering is inapplicable (guard failure) "
-                        + "— falling back to enumeration");
+                GuardFailureInfo gf = replayResult.guardFailure();
+                if (gf != null && gf.lastOtherBranchCommitIndex() >= 0) {
+                    int fromNode = gf.failedFromA()
+                            ? graph.nodeA(gf.failedCommitIndex())
+                            : graph.nodeB(gf.failedCommitIndex());
+                    int toNode = gf.failedFromA()
+                            ? graph.nodeB(gf.lastOtherBranchCommitIndex())
+                            : graph.nodeA(gf.lastOtherBranchCommitIndex());
+                    int[] newEdge = {fromNode, toNode};
+
+                    // Check if this exact edge was already added (no progress possible)
+                    boolean duplicate = runtimeEdges.stream()
+                            .anyMatch(e -> e[0] == newEdge[0] && e[1] == newEdge[1]);
+
+                    if (!duplicate) {
+                        runtimeEdges.add(newEdge);
+                        LOGGER.info("[INTERLEAVE] Guard failure: adding runtime edge "
+                                + "{}[{}] → {}[{}] — retrying",
+                                gf.failedFromA() ? "A" : "B", gf.failedCommitIndex(),
+                                gf.failedFromA() ? "B" : "A", gf.lastOtherBranchCommitIndex());
+                        MergeTracer.trace("[INTERLEAVE] Guard failure → runtime edge "
+                                + (gf.failedFromA() ? "A" : "B") + "[" + gf.failedCommitIndex() + "]"
+                                + " → "
+                                + (gf.failedFromA() ? "B" : "A") + "[" + gf.lastOtherBranchCommitIndex() + "]");
+                        continue; // Retry with updated graph
+                    }
+
+                    LOGGER.warn("[INTERLEAVE] Duplicate runtime edge — no progress. "
+                            + "Falling back to enumeration");
+                } else {
+                    LOGGER.warn("[INTERLEAVE] Guard failure without identifiable dependency. "
+                            + "Falling back to enumeration");
+                }
                 MergeTracer.trace("[INTERLEAVE] Guard failure → enumeration fallback");
                 return mergeWithInterleavingEnumeration(baseDir, aTransactions, bTransactions,
                         aDtos, bDtos, baseUuidToElement, m, n);
@@ -461,7 +499,20 @@ public class SemanticMergeEngine {
             SemanticMergeResult result,
             Map<Integer, Set<String>> actualAReactionFP,
             Map<Integer, Set<String>> actualBReactionFP,
-            boolean inapplicable
+            boolean inapplicable,
+            GuardFailureInfo guardFailure
+    ) {}
+
+    /**
+     * Captures which commit failed during replay and which preceding
+     * other-branch commit is the likely cause.  Used to add a runtime
+     * dependency edge so the graph can be re-sorted without falling
+     * back to full enumeration.
+     */
+    private record GuardFailureInfo(
+            boolean failedFromA,
+            int failedCommitIndex,
+            int lastOtherBranchCommitIndex
     ) {}
 
     private InterleavingReplayResult tryInterleavingWithFootprintCapture(
@@ -489,10 +540,13 @@ public class SemanticMergeEngine {
         Map<Integer, Set<String>> actualBReactionFP = new HashMap<>();
 
         int aIdx = 0, bIdx = 0;
+        boolean lastStepFromA = false;
+        int lastTxnIndex = -1;
 
         try {
             for (int step = 0; step < ordering.size(); step++) {
                 boolean fromA = ordering.get(step);
+                lastStepFromA = fromA;
                 List<SemanticChangeLog.ChangeDto> txnDtos;
                 Set<String> otherBranchFootprintsSoFar;
                 int txnIndex;
@@ -500,11 +554,13 @@ public class SemanticMergeEngine {
                 if (fromA) {
                     if (aIdx >= aTransactions.size()) continue;
                     txnIndex = aIdx;
+                    lastTxnIndex = txnIndex;
                     txnDtos = aTransactions.get(aIdx++);
                     otherBranchFootprintsSoFar = new HashSet<>(bFootprintsSoFar);
                 } else {
                     if (bIdx >= bTransactions.size()) continue;
                     txnIndex = bIdx;
+                    lastTxnIndex = txnIndex;
                     txnDtos = bTransactions.get(bIdx++);
                     otherBranchFootprintsSoFar = new HashSet<>(aFootprintsSoFar);
                 }
@@ -581,7 +637,11 @@ public class SemanticMergeEngine {
                     orderingToString(ordering), e.getMessage());
             LOGGER.debug("[INTERLEAVE] Guard failure details", e);
             vsum.dispose();
-            return new InterleavingReplayResult(null, actualAReactionFP, actualBReactionFP, true);
+            int lastOtherBranchIdx = lastStepFromA ? (bIdx - 1) : (aIdx - 1);
+            GuardFailureInfo gf = (lastOtherBranchIdx >= 0)
+                    ? new GuardFailureInfo(lastStepFromA, lastTxnIndex, lastOtherBranchIdx)
+                    : null;
+            return new InterleavingReplayResult(null, actualAReactionFP, actualBReactionFP, true, gf);
         }
 
         vsum.dispose();
@@ -590,7 +650,7 @@ public class SemanticMergeEngine {
         allWarnings.addAll(indirectConflicts);
 
         SemanticMergeResult result = SemanticMergeResult.success(allApplied, allWarnings, baseWorkDir);
-        return new InterleavingReplayResult(result, actualAReactionFP, actualBReactionFP, false);
+        return new InterleavingReplayResult(result, actualAReactionFP, actualBReactionFP, false, null);
     }
 
     private SemanticMergeResult mergeWithInterleavingEnumeration(
