@@ -12,26 +12,34 @@ import java.util.UUID;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 /**
- * Manages the reload trigger file used for inter-process communication between the
+ * Manages the reload trigger file used for inter-process communication between
+ * the
  * Git {@code post-checkout} hook and
  * {@link tools.vitruv.framework.vsum.branch.handler.VsumReloadWatcher}.
  *
  * <ul>
- *   <li>The Git post-checkout hook creates this file after a branch switch.</li>
- *   <li>The watcher polls for the file at a fixed interval.</li>
- *   <li>When found, the watcher reads it, deletes it, and reloads the VirtualModel.</li>
+ * <li>The Git post-checkout hook creates this file after a branch switch.</li>
+ * <li>The watcher polls for the file at a fixed interval.</li>
+ * <li>When found, the watcher reads it, deletes it, and reloads the
+ * VirtualModel.</li>
  * </ul>
  *
- * <p>This file-based approach ensures that the VirtualModel is reloaded even when
- * developers perform branch switches using the command-line Git interface rather than
+ * <p>
+ * This file-based approach ensures that the VirtualModel is reloaded even when
+ * developers perform branch switches using the command-line Git interface
+ * rather than
  * through the Vitruvius API.
  *
- * <p>Unlike validation triggers, reload triggers are fire-and-forget: the hook does
+ * <p>
+ * Unlike validation triggers, reload triggers are fire-and-forget: the hook
+ * does
  * not wait for a result file. The request identifier is provided purely for
  * logging and traceability across hook and watcher logs.
  *
- * <p>File format: {@code branchName|requestId|timestamp}
- * <br>Legacy format (still accepted): {@code branchName}
+ * <p>
+ * File format: {@code branchName|requestId|timestamp}
+ * <br>
+ * Legacy format (still accepted): {@code branchName}
  */
 public class ReloadTriggerFile extends AbstractTriggerFile<ReloadTriggerFile.TriggerInfo> {
 
@@ -53,12 +61,14 @@ public class ReloadTriggerFile extends AbstractTriggerFile<ReloadTriggerFile.Tri
      * Creates the trigger file to signal that a VirtualModel reload is needed for
      * the given branch. A unique request identifier is generated for traceability.
      *
-     * <p>File format: {@code branchName|requestId|timestamp}
+     * <p>
+     * File format: {@code branchName|requestId|timestamp}
      *
      * @param branchName the name of the branch that was just checked out.
      *                   Must not be null.
      * @return the generated request identifier (UUID string) for logging purposes.
-     * @throws IOException if the trigger file or its parent directory cannot be created.
+     * @throws IOException if the trigger file or its parent directory cannot be
+     *                     created.
      */
     public String createTrigger(String branchName) throws IOException {
         checkNotNull(branchName, "branch name must not be null");
@@ -79,12 +89,14 @@ public class ReloadTriggerFile extends AbstractTriggerFile<ReloadTriggerFile.Tri
     /**
      * Parses the split fields into a {@link TriggerInfo}.
      *
-     * <p>Accepts the current three-field format and the legacy single-field format
+     * <p>
+     * Accepts the current three-field format and the legacy single-field format
      * written by older hook versions. Returns {@code null} if the field count is
      * unexpected or any required field is empty.
      *
      * @param parts the fields split on {@link #DELIMITER}.
-     * @return the parsed {@link TriggerInfo}, or {@code null} if the parts are invalid.
+     * @return the parsed {@link TriggerInfo}, or {@code null} if the parts are
+     *         invalid.
      */
     @Override
     protected TriggerInfo parseTriggerInfo(String[] parts) {
@@ -110,8 +122,12 @@ public class ReloadTriggerFile extends AbstractTriggerFile<ReloadTriggerFile.Tri
                 timestamp = java.lang.System.currentTimeMillis();
             }
         } else {
-            // legacy single-field format: the entire content is just the branch name.
-            branchName = parts[0].trim();
+            // legacy single-field format: either a plain branch name or the old
+            // human-readable "Reload requested at: <datetime>" text produced by
+            // older hook versions. In the latter case the branch name cannot be
+            // recovered, so "unknown" is substituted.
+            String raw = parts[0].trim();
+            branchName = raw.startsWith("Reload requested at:") ? "unknown" : raw;
             requestId = UUID.randomUUID().toString();
             timestamp = java.lang.System.currentTimeMillis();
             LOGGER.warn("Legacy reload trigger format detected, generated requestId='{}'",
@@ -129,11 +145,11 @@ public class ReloadTriggerFile extends AbstractTriggerFile<ReloadTriggerFile.Tri
         return new TriggerInfo(branchName, requestId, timestamp);
     }
 
-
     /**
      * Holds the information parsed from a reload trigger file.
      *
-     * <p>Unlike validation trigger information, reload trigger information has no
+     * <p>
+     * Unlike validation trigger information, reload trigger information has no
      * associated result file - the hook is fire-and-forget. The request identifier
      * is provided purely for traceability across hook and watcher logs.
      */
@@ -159,8 +175,10 @@ public class ReloadTriggerFile extends AbstractTriggerFile<ReloadTriggerFile.Tri
 
         @Override
         public boolean equals(Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
+            if (this == o)
+                return true;
+            if (o == null || getClass() != o.getClass())
+                return false;
             TriggerInfo that = (TriggerInfo) o;
             return getTimestamp() == that.getTimestamp()
                     && Objects.equals(branchName, that.branchName)
