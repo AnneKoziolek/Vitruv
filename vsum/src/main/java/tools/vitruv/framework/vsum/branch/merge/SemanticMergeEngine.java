@@ -1302,13 +1302,32 @@ public class SemanticMergeEngine {
             }
         }
 
+        // Cache ID remapping: the deserializer assigns placeholder cache IDs ("cache:/0", etc.)
+        // that may not match the HierarchicalIdResolver's internal cache ID counter.
+        // When CreateEObject is processed, we record placeholder → actual ID mapping,
+        // so subsequent InsertEReference can resolve the created element correctly.
+        Map<String, HierarchicalId> cacheIdRemap = new HashMap<>();
+
         // Apply each change using EMF reflective API (triggers notifications for ChangeRecorder)
-        for (EChange<HierarchicalId> eChange : changes) {
-            applyChangeReflectively(eChange, idResolver, hidFallback);
+        for (int ci = 0; ci < changes.size(); ci++) {
+            EChange<HierarchicalId> eChange = changes.get(ci);
+            try {
+                applyChangeReflectively(eChange, idResolver, hidFallback, cacheIdRemap);
+            } catch (Exception e) {
+                MergeTracer.trace("[REPLAY] Failed at change " + (ci + 1) + "/" + changes.size()
+                        + ": " + eChange.getClass().getSimpleName() + " — " + e.getMessage());
+                throw e;
+            }
         }
 
         // Commit: ChangeRecordingView captured EMF notifications → propagateChange → reactions fire
-        view.commitChanges();
+        try {
+            view.commitChanges();
+        } catch (Exception e) {
+            MergeTracer.trace("[REPLAY] commitChanges failed: " + e.getClass().getSimpleName()
+                    + " — " + e.getMessage());
+            throw e;
+        }
     }
 
     /**
@@ -1335,6 +1354,16 @@ public class SemanticMergeEngine {
      * when replaying from the common ancestor, reactions from earlier transactions may
      * have changed model structure, making the HierarchicalId paths invalid.
      */
+    /**
+     * Remaps a cache ID from the deserializer's placeholder to the resolver's actual ID.
+     * Non-cache IDs are returned unchanged.
+     */
+    private static HierarchicalId remapCacheId(HierarchicalId hid, Map<String, HierarchicalId> cacheIdRemap) {
+        if (hid == null || cacheIdRemap == null || cacheIdRemap.isEmpty()) return hid;
+        HierarchicalId remapped = cacheIdRemap.get(hid.getId());
+        return remapped != null ? remapped : hid;
+    }
+
     /**
      * Resolves an element by HierarchicalId with UUID verification and fallback.
      *
@@ -1386,21 +1415,29 @@ public class SemanticMergeEngine {
     @SuppressWarnings("unchecked")
     private static void applyChangeReflectively(EChange<HierarchicalId> eChange,
                                           tools.vitruv.change.atomic.hid.internal.HierarchicalIdResolver idResolver,
-                                          Map<String, EObject> hidFallback) {
+                                          Map<String, EObject> hidFallback,
+                                          Map<String, HierarchicalId> cacheIdRemap) {
         if (eChange instanceof tools.vitruv.change.atomic.eobject.CreateEObject<HierarchicalId> ce) {
             EObject created = EcoreUtil.create(ce.getAffectedEObjectType());
-            idResolver.getAndUpdateId(created);
+            HierarchicalId assignedId = idResolver.getAndUpdateId(created);
+            // Record the mapping from the deserializer's placeholder cache ID
+            // to the resolver's actual cache ID
+            HierarchicalId placeholderId = ce.getAffectedElement();
+            if (placeholderId != null && placeholderId.isCache()
+                    && !placeholderId.equals(assignedId)) {
+                cacheIdRemap.put(placeholderId.getId(), assignedId);
+            }
 
         } else if (eChange instanceof tools.vitruv.change.atomic.feature.reference.InsertEReference<HierarchicalId> ir) {
-            EObject container = resolveElement(ir.getAffectedElement(), idResolver, hidFallback);
-            EObject newElement = resolveElement(ir.getNewValue(), idResolver, hidFallback);
+            EObject container = resolveElement(remapCacheId(ir.getAffectedElement(), cacheIdRemap), idResolver, hidFallback);
+            EObject newElement = resolveElement(remapCacheId(ir.getNewValue(), cacheIdRemap), idResolver, hidFallback);
             var list = (List<EObject>) container.eGet(ir.getAffectedFeature());
             // Set-based semantics: always append, ignore recorded index.
             // Multi-valued features are treated as sets for merge purposes.
             list.add(newElement);
 
         } else if (eChange instanceof tools.vitruv.change.atomic.feature.attribute.ReplaceSingleValuedEAttribute<HierarchicalId, ?> rsa) {
-            EObject element = resolveElement(rsa.getAffectedElement(), idResolver, hidFallback);
+            EObject element = resolveElement(remapCacheId(rsa.getAffectedElement(), cacheIdRemap), idResolver, hidFallback);
             if (element == null) {
                 throw new IllegalStateException("Cannot apply ReplaceSingleValuedEAttribute: "
                         + "element not found for " + rsa.getAffectedElement());
@@ -1409,7 +1446,7 @@ public class SemanticMergeEngine {
 
         } else if (eChange instanceof tools.vitruv.change.atomic.feature.reference.RemoveEReference<HierarchicalId> rr) {
             try {
-                EObject container = resolveElement(rr.getAffectedElement(), idResolver, hidFallback);
+                EObject container = resolveElement(remapCacheId(rr.getAffectedElement(), cacheIdRemap), idResolver, hidFallback);
                 if (container == null) throw new Exception("Container not found");
                 var list = (List<EObject>) container.eGet(rr.getAffectedFeature());
                 if (rr.getIndex() >= 0 && rr.getIndex() < list.size()) {
@@ -1421,7 +1458,7 @@ public class SemanticMergeEngine {
             }
 
         } else if (eChange instanceof tools.vitruv.change.atomic.eobject.DeleteEObject<HierarchicalId> de) {
-            EObject element = resolveElement(de.getAffectedElement(), idResolver, hidFallback);
+            EObject element = resolveElement(remapCacheId(de.getAffectedElement(), cacheIdRemap), idResolver, hidFallback);
             if (element != null) {
                 EcoreUtil.remove(element);
             } else {
@@ -1430,13 +1467,13 @@ public class SemanticMergeEngine {
             }
 
         } else if (eChange instanceof tools.vitruv.change.atomic.feature.attribute.InsertEAttributeValue<HierarchicalId, ?> ia) {
-            EObject element = resolveElement(ia.getAffectedElement(), idResolver, hidFallback);
+            EObject element = resolveElement(remapCacheId(ia.getAffectedElement(), cacheIdRemap), idResolver, hidFallback);
             var list = (List<Object>) element.eGet(ia.getAffectedFeature());
             // Set-based semantics: always append, ignore recorded index.
             list.add(ia.getNewValue());
 
         } else if (eChange instanceof tools.vitruv.change.atomic.root.InsertRootEObject<HierarchicalId> iro) {
-            EObject newRoot = resolveElement(iro.getNewValue(), idResolver, hidFallback);
+            EObject newRoot = resolveElement(remapCacheId(iro.getNewValue(), cacheIdRemap), idResolver, hidFallback);
             // Set-based semantics: always append, ignore recorded index.
             idResolver.getResource(org.eclipse.emf.common.util.URI.createURI(iro.getUri()))
                     .getContents().add(newRoot);
