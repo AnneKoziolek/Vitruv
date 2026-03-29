@@ -289,11 +289,6 @@ public class SemanticMergeEngine {
             return SemanticMergeResult.success(List.of(), baseDir);
         }
 
-        // Load base VSUM for USER_VS_DERIVED_WARNING comparison
-        InternalVirtualModel baseVsum = GitStateLoader.loadVsumFromDir(baseDir, specs, interactionProvider);
-        Map<String, EObject> baseUuidToElement = buildUuidMap(baseVsum);
-        baseVsum.dispose();
-
         // Compute direct footprints (free — from changelog DTOs)
         List<Set<String>> aDirectFP = aTransactions.stream()
                 .map(this::collectUuidFootprints).toList();
@@ -422,7 +417,7 @@ public class SemanticMergeEngine {
 
             InterleavingReplayResult replayResult = tryInterleavingWithFootprintCapture(
                     tryDir, aTransactions, bTransactions, ordering,
-                    aDtos, bDtos, baseUuidToElement, knownUuids);
+                    aDtos, bDtos, knownUuids);
 
             // Guard failure: the graph-proposed ordering makes some commit inapplicable.
             // Add the discovered dependency edge and retry instead of falling back to enumeration.
@@ -462,7 +457,7 @@ public class SemanticMergeEngine {
                 }
                 MergeTracer.trace("[INTERLEAVE] Guard failure → enumeration fallback");
                 return mergeWithInterleavingEnumeration(baseDir, aTransactions, bTransactions,
-                        aDtos, bDtos, baseUuidToElement, m, n);
+                        aDtos, bDtos, m, n);
             }
 
             // Check if actual reaction footprints add new entries (monotone union)
@@ -490,23 +485,10 @@ public class SemanticMergeEngine {
                 LOGGER.info("[INTERLEAVE] Fixed point reached at iteration {}", iteration + 1);
                 MergeTracer.trace("[INTERLEAVE] Fixed point at iteration " + (iteration + 1));
                 SemanticMergeResult result = replayResult.result();
-                List<MergeConflict> indirectInResult = result.getWarnings().stream()
-                        .filter(w -> w.getType() == MergeConflict.ConflictType.INDIRECT_CONFLICT)
-                        .toList();
-                if (indirectInResult.isEmpty()) {
-                    return SemanticMergeResult.success(
-                            result.getAppliedChanges(), result.getWarnings(),
-                            result.getMergedStateFolder(),
-                            SemanticMergeResult.MergeDirection.INTERLEAVED);
-                } else {
-                    List<MergeConflict> escalated = indirectInResult.stream()
-                            .map(ic -> new MergeConflict(ic.getElementId(),
-                                    MergeConflict.ConflictType.INTERLEAVING_CONFLICT,
-                                    ic.getElementUuid(), ic.getConflictingFeature(),
-                                    ic.getBaseValue(), ic.getOursValue(), ic.getTheirsValue()))
-                            .toList();
-                    return SemanticMergeResult.conflict(escalated);
-                }
+                return SemanticMergeResult.success(
+                        result.getAppliedChanges(), List.of(),
+                        result.getMergedStateFolder(),
+                        SemanticMergeResult.MergeDirection.INTERLEAVED);
             }
             MergeTracer.trace("[INTERLEAVE] New reaction footprints discovered — re-sorting");
         }
@@ -551,7 +533,6 @@ public class SemanticMergeEngine {
             List<Boolean> ordering,
             List<SemanticChangeLog.ChangeDto> allADtos,
             List<SemanticChangeLog.ChangeDto> allBDtos,
-            Map<String, EObject> baseUuidToElement,
             Set<String> knownUuids) throws IOException {
 
         String uriPrefix = org.eclipse.emf.common.util.URI.createFileURI(
@@ -560,11 +541,6 @@ public class SemanticMergeEngine {
         InternalVirtualModel vsum = GitStateLoader.loadVsumFromDir(baseWorkDir, specs, interactionProvider);
 
         List<EChange<HierarchicalId>> allApplied = new ArrayList<>();
-        List<MergeConflict> indirectConflicts = new ArrayList<>();
-        List<MergeConflict> warnings = new ArrayList<>();
-
-        Set<String> aFootprintsSoFar = new HashSet<>();
-        Set<String> bFootprintsSoFar = new HashSet<>();
 
         Map<Integer, Set<String>> actualAReactionFP = new HashMap<>();
         Map<Integer, Set<String>> actualBReactionFP = new HashMap<>();
@@ -578,7 +554,6 @@ public class SemanticMergeEngine {
                 boolean fromA = ordering.get(step);
                 lastStepFromA = fromA;
                 List<SemanticChangeLog.ChangeDto> txnDtos;
-                Set<String> otherBranchFootprintsSoFar;
                 int txnIndex;
 
                 if (fromA) {
@@ -586,40 +561,14 @@ public class SemanticMergeEngine {
                     txnIndex = aIdx;
                     lastTxnIndex = txnIndex;
                     txnDtos = aTransactions.get(aIdx++);
-                    otherBranchFootprintsSoFar = new HashSet<>(bFootprintsSoFar);
                 } else {
                     if (bIdx >= bTransactions.size()) continue;
                     txnIndex = bIdx;
                     lastTxnIndex = txnIndex;
                     txnDtos = bTransactions.get(bIdx++);
-                    otherBranchFootprintsSoFar = new HashSet<>(aFootprintsSoFar);
                 }
 
                 if (txnDtos.isEmpty()) continue;
-
-                Set<String> txnFootprints = collectUuidFootprints(txnDtos);
-                if (fromA) {
-                    aFootprintsSoFar.addAll(txnFootprints);
-                } else {
-                    bFootprintsSoFar.addAll(txnFootprints);
-                }
-
-                Map<String, EObject> uuidToElement = buildUuidMap(vsum);
-
-                warnings.addAll(detectUserVsDerivedWarnings(
-                        txnDtos, otherBranchFootprintsSoFar, uuidToElement, baseUuidToElement));
-
-                Map<String, Object> preReplayValues = snapshotUserFootprintValues(
-                        otherBranchFootprintsSoFar, uuidToElement);
-
-                List<SemanticChangeLog.ChangeDto> otherDtos = new ArrayList<>();
-                for (String fp : otherBranchFootprintsSoFar) {
-                    String[] parts = fp.split("#", 2);
-                    SemanticChangeLog.ChangeDto d = new SemanticChangeLog.ChangeDto();
-                    d.affectedElementUuid = parts[0];
-                    d.featureName = parts.length > 1 ? parts[1] : null;
-                    otherDtos.add(d);
-                }
 
                 ChangeDtoDeserializer deserializer = new ChangeDtoDeserializer(null, uriPrefix);
                 List<EChange<HierarchicalId>> txnChanges = deserializer.deserializeAll(txnDtos);
@@ -648,25 +597,8 @@ public class SemanticMergeEngine {
                     actualBReactionFP.put(txnIndex, actualFP);
                 }
 
-                List<MergeConflict> txnIndirect = detectIndirectConflicts(
-                        derivedCapture.getDerivedChanges(), otherDtos, vsum.getUuidResolver());
-
-                Set<String> thisTxnDirectFootprints = collectUuidFootprints(txnDtos);
-                Map<String, EObject> postReplayMap = buildUuidMap(vsum);
-                txnIndirect.addAll(detectIndirectConflictsViaSnapshot(
-                        preReplayValues, otherBranchFootprintsSoFar,
-                        thisTxnDirectFootprints, postReplayMap));
-
-                Set<String> seen = new HashSet<>();
-                for (MergeConflict ic : txnIndirect) {
-                    String key = ic.getElementUuid() + "#" + ic.getConflictingFeature();
-                    if (seen.add(key)) {
-                        indirectConflicts.add(ic);
-                    }
-                }
-
-                LOGGER.debug("Step {}: replayed {} changes from {}, {} indirect conflicts so far",
-                        step + 1, txnChanges.size(), fromA ? "A" : "B", indirectConflicts.size());
+                LOGGER.debug("Step {}: replayed {} changes from {}",
+                        step + 1, txnChanges.size(), fromA ? "A" : "B");
             }
         } catch (Exception e) {
             LOGGER.warn("[INTERLEAVE] Ordering {} is inapplicable (guard failure): {}",
@@ -682,10 +614,7 @@ public class SemanticMergeEngine {
 
         vsum.dispose();
 
-        List<MergeConflict> allWarnings = new ArrayList<>(warnings);
-        allWarnings.addAll(indirectConflicts);
-
-        SemanticMergeResult result = SemanticMergeResult.success(allApplied, allWarnings, baseWorkDir);
+        SemanticMergeResult result = SemanticMergeResult.success(allApplied, List.of(), baseWorkDir);
         return new InterleavingReplayResult(result, actualAReactionFP, actualBReactionFP, false, null);
     }
 
@@ -695,16 +624,12 @@ public class SemanticMergeEngine {
             List<List<SemanticChangeLog.ChangeDto>> bTransactions,
             List<SemanticChangeLog.ChangeDto> aDtos,
             List<SemanticChangeLog.ChangeDto> bDtos,
-            Map<String, EObject> baseUuidToElement,
             int m, int n) throws IOException {
 
         // Generate candidate orderings
         InterleavingGenerator generator = new InterleavingGenerator();
         List<List<Boolean>> orderings = generator.generate(m, n);
         LOGGER.info("[FALLBACK] Testing {} interleaving ordering(s)", orderings.size());
-
-        SemanticMergeResult bestResult = null;
-        int bestConflictCount = Integer.MAX_VALUE;
 
         for (int oi = 0; oi < orderings.size(); oi++) {
             List<Boolean> ordering = orderings.get(oi);
@@ -718,7 +643,7 @@ public class SemanticMergeEngine {
 
             SemanticMergeResult result = tryInterleaving(
                     tryDir, aTransactions, bTransactions, ordering,
-                    aDtos, bDtos, baseUuidToElement);
+                    aDtos, bDtos);
 
             if (result == null) {
                 // Guard failure: this ordering makes some commit inapplicable — skip it
@@ -728,50 +653,22 @@ public class SemanticMergeEngine {
             }
 
             if (result.isSuccess()) {
-                List<MergeConflict> indirectInResult = result.getWarnings().stream()
-                        .filter(w -> w.getType() == MergeConflict.ConflictType.INDIRECT_CONFLICT)
-                        .toList();
-
-                if (indirectInResult.isEmpty()) {
-                    LOGGER.info("[FALLBACK] Found clean interleaving at ordering {}/{}", oi + 1, orderings.size());
-                    MergeTracer.trace("[FALLBACK] Clean ordering found at attempt " + (oi + 1));
-                    return SemanticMergeResult.success(
-                            result.getAppliedChanges(),
-                            result.getWarnings(),
-                            result.getMergedStateFolder(),
-                            SemanticMergeResult.MergeDirection.INTERLEAVED);
-                }
-
-                int conflictCount = indirectInResult.size();
-                if (conflictCount < bestConflictCount) {
-                    bestConflictCount = conflictCount;
-                    bestResult = result;
-                }
+                LOGGER.info("[FALLBACK] Found clean interleaving at ordering {}/{}", oi + 1, orderings.size());
+                MergeTracer.trace("[FALLBACK] Clean ordering found at attempt " + (oi + 1));
+                return SemanticMergeResult.success(
+                        result.getAppliedChanges(),
+                        List.of(),
+                        result.getMergedStateFolder(),
+                        SemanticMergeResult.MergeDirection.INTERLEAVED);
             }
         }
 
         LOGGER.warn("[FALLBACK] No clean interleaving found — escalating to INTERLEAVING_CONFLICT");
         MergeTracer.trace("[FALLBACK] No clean ordering found → INTERLEAVING_CONFLICT");
 
-        List<MergeConflict> interleavingConflicts = new ArrayList<>();
-        if (bestResult != null) {
-            for (MergeConflict w : bestResult.getWarnings()) {
-                if (w.getType() == MergeConflict.ConflictType.INDIRECT_CONFLICT
-                        || w.getType() == MergeConflict.ConflictType.BIDIRECTIONAL_INDIRECT_CONFLICT) {
-                    interleavingConflicts.add(new MergeConflict(
-                            w.getElementId(),
-                            MergeConflict.ConflictType.INTERLEAVING_CONFLICT,
-                            w.getElementUuid(), w.getConflictingFeature(),
-                            w.getBaseValue(), w.getOursValue(), w.getTheirsValue()));
-                }
-            }
-        }
-        if (interleavingConflicts.isEmpty()) {
-            interleavingConflicts.add(new MergeConflict(
-                    "unknown", MergeConflict.ConflictType.INTERLEAVING_CONFLICT,
-                    null, null, null, null, null));
-        }
-        return SemanticMergeResult.conflict(interleavingConflicts);
+        return SemanticMergeResult.conflict(List.of(new MergeConflict(
+                "unknown", MergeConflict.ConflictType.INTERLEAVING_CONFLICT,
+                null, null, null, null, null)));
     }
 
     private static Set<String> minus(Set<String> a, Set<String> b) {
@@ -923,122 +820,50 @@ public class SemanticMergeEngine {
             List<List<SemanticChangeLog.ChangeDto>> bTransactions,
             List<Boolean> ordering,
             List<SemanticChangeLog.ChangeDto> allADtos,
-            List<SemanticChangeLog.ChangeDto> allBDtos,
-            Map<String, EObject> baseUuidToElement) throws IOException {
+            List<SemanticChangeLog.ChangeDto> allBDtos) throws IOException {
 
         String uriPrefix = org.eclipse.emf.common.util.URI.createFileURI(
                 baseWorkDir.toAbsolutePath().toString()).toString();
 
-        // Load VSUM from base state
         InternalVirtualModel vsum = GitStateLoader.loadVsumFromDir(baseWorkDir, specs, interactionProvider);
 
         List<EChange<HierarchicalId>> allApplied = new ArrayList<>();
-        List<MergeConflict> indirectConflicts = new ArrayList<>();
-        List<MergeConflict> warnings = new ArrayList<>();
-
-        // Dynamic footprint tracking: which footprints have been replayed from A vs B so far
-        Set<String> aFootprintsSoFar = new HashSet<>();
-        Set<String> bFootprintsSoFar = new HashSet<>();
-
         int aIdx = 0, bIdx = 0;
 
         try {
             for (int step = 0; step < ordering.size(); step++) {
                 boolean fromA = ordering.get(step);
                 List<SemanticChangeLog.ChangeDto> txnDtos;
-                Set<String> otherBranchFootprintsSoFar;
 
                 if (fromA) {
                     if (aIdx >= aTransactions.size()) continue;
                     txnDtos = aTransactions.get(aIdx++);
-                    otherBranchFootprintsSoFar = new HashSet<>(bFootprintsSoFar);
                 } else {
                     if (bIdx >= bTransactions.size()) continue;
                     txnDtos = bTransactions.get(bIdx++);
-                    otherBranchFootprintsSoFar = new HashSet<>(aFootprintsSoFar);
                 }
 
                 if (txnDtos.isEmpty()) continue;
 
-                // Update the running footprint set for the current branch
-                Set<String> txnFootprints = collectUuidFootprints(txnDtos);
-                if (fromA) {
-                    aFootprintsSoFar.addAll(txnFootprints);
-                } else {
-                    bFootprintsSoFar.addAll(txnFootprints);
-                }
-
-                Map<String, EObject> uuidToElement = buildUuidMap(vsum);
-
-                // USER_VS_DERIVED_WARNING: if this txn's user changes touch elements whose
-                // current state was derived by the OTHER branch's already-replayed commits
-                warnings.addAll(detectUserVsDerivedWarnings(
-                        txnDtos, otherBranchFootprintsSoFar, uuidToElement, baseUuidToElement));
-
-                // Snapshot other-branch footprint values BEFORE replay
-                Map<String, Object> preReplayValues = snapshotUserFootprintValues(
-                        otherBranchFootprintsSoFar, uuidToElement);
-
-                // Build synthetic DTO list from the other-branch footprint set for conflict detection
-                List<SemanticChangeLog.ChangeDto> otherDtos = new ArrayList<>();
-                for (String fp : otherBranchFootprintsSoFar) {
-                    String[] parts = fp.split("#", 2);
-                    SemanticChangeLog.ChangeDto d = new SemanticChangeLog.ChangeDto();
-                    d.affectedElementUuid = parts[0];
-                    d.featureName = parts.length > 1 ? parts[1] : null;
-                    otherDtos.add(d);
-                }
-
-                // Deserialize and replay
                 ChangeDtoDeserializer deserializer = new ChangeDtoDeserializer(null, uriPrefix);
                 List<EChange<HierarchicalId>> txnChanges = deserializer.deserializeAll(txnDtos);
                 if (txnChanges.isEmpty()) continue;
 
-                DerivedChangeCapture derivedCapture = new DerivedChangeCapture();
-                vsum.addChangePropagationListener(derivedCapture);
-
                 replayChanges(vsum, txnChanges);
-
-                vsum.removeChangePropagationListener(derivedCapture);
                 allApplied.addAll(txnChanges);
 
-                // Detect indirect conflicts: derived(replay(this txn)) vs user(other branch so far)
-                List<MergeConflict> txnIndirect = detectIndirectConflicts(
-                        derivedCapture.getDerivedChanges(), otherDtos, vsum.getUuidResolver());
-
-                // Snapshot-based detection
-                Set<String> thisTxnDirectFootprints = collectUuidFootprints(txnDtos);
-                Map<String, EObject> postReplayMap = buildUuidMap(vsum);
-                txnIndirect.addAll(detectIndirectConflictsViaSnapshot(
-                        preReplayValues, otherBranchFootprintsSoFar,
-                        thisTxnDirectFootprints, postReplayMap));
-
-                // Deduplicate
-                Set<String> seen = new HashSet<>();
-                for (MergeConflict ic : txnIndirect) {
-                    String key = ic.getElementUuid() + "#" + ic.getConflictingFeature();
-                    if (seen.add(key)) {
-                        indirectConflicts.add(ic);
-                    }
-                }
-
-                LOGGER.debug("Step {}: replayed {} changes from {}, {} indirect conflicts so far",
-                        step + 1, txnChanges.size(), fromA ? "A" : "B", indirectConflicts.size());
+                LOGGER.debug("Step {}: replayed {} changes from {}",
+                        step + 1, txnChanges.size(), fromA ? "A" : "B");
             }
         } catch (Exception e) {
             LOGGER.warn("[FALLBACK] Ordering {} is inapplicable (guard failure): {}",
                     orderingToString(ordering), e.getMessage());
-            LOGGER.debug("[FALLBACK] Guard failure details", e);
             vsum.dispose();
-            return null; // signal: this ordering is inapplicable; caller should try next
+            return null;
         }
 
         vsum.dispose();
-
-        List<MergeConflict> allWarnings = new ArrayList<>(warnings);
-        allWarnings.addAll(indirectConflicts);
-
-        return SemanticMergeResult.success(allApplied, allWarnings, baseWorkDir);
+        return SemanticMergeResult.success(allApplied, List.of(), baseWorkDir);
     }
 
     /**
