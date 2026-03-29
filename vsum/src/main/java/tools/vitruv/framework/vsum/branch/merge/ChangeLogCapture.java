@@ -3,8 +3,10 @@ package tools.vitruv.framework.vsum.branch.merge;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -74,6 +76,8 @@ public class ChangeLogCapture implements ChangePropagationListener {
     private final Map<Uuid, HierarchicalId> preCapturedIds = new HashMap<>();
     /** Cascade-deleted child UUIDs: parentUuidString → list of child UUID strings. */
     private final Map<String, List<String>> cascadeDeletedUuids = new HashMap<>();
+    /** Consequential footprints: UUID#feature pairs modified by Reactions during propagation. */
+    private final Set<String> consequentialFootprints = new HashSet<>();
 
     public ChangeLogCapture(UuidResolver uuidResolver, HierarchicalIdResolver hierarchicalIdResolver) {
         this.uuidResolver = uuidResolver;
@@ -167,6 +171,26 @@ public class ChangeLogCapture implements ChangePropagationListener {
             // Build UUID→HierarchicalId mapping using the pre-captured UUIDs
             buildUuidMappingFromStrings();
             LOGGER.debug("Captured {}/{} primary changes for changelog", captured, uuidChanges.size());
+
+            // Extract consequential footprints from reaction-derived changes
+            for (PropagatedChange pc : propagatedChanges) {
+                VitruviusChange<EObject> consequential = pc.getConsequentialChanges();
+                if (consequential == null || !consequential.containsConcreteChange()) continue;
+                for (EChange<EObject> ec : consequential.getEChanges()) {
+                    if (!(ec instanceof tools.vitruv.change.atomic.feature.FeatureEChange<EObject, ?> fc))
+                        continue;
+                    EObject element = fc.getAffectedElement();
+                    String featureName = fc.getAffectedFeature() != null
+                            ? fc.getAffectedFeature().getName() : null;
+                    if (element == null || featureName == null) continue;
+                    try {
+                        String uuid = uuidResolver.getUuid(element).toString();
+                        consequentialFootprints.add(uuid + "#" + featureName);
+                    } catch (IllegalStateException e) {
+                        // Element not in resolver (transiently created by reaction) — skip
+                    }
+                }
+            }
         } catch (Exception e) {
             LOGGER.error("Failed to capture changes for changelog: {}", e.getMessage(), e);
         } finally {
@@ -202,6 +226,17 @@ public class ChangeLogCapture implements ChangePropagationListener {
     public Map<String, List<String>> drainCascadeDeletedUuids() {
         Map<String, List<String>> result = new HashMap<>(cascadeDeletedUuids);
         cascadeDeletedUuids.clear();
+        return result;
+    }
+
+    /**
+     * Returns the consequential footprints accumulated during capture.
+     * Each entry is a UUID#feature string representing an element-feature pair
+     * modified by Reactions during change propagation.
+     */
+    public Set<String> drainConsequentialFootprints() {
+        Set<String> result = new HashSet<>(consequentialFootprints);
+        consequentialFootprints.clear();
         return result;
     }
 

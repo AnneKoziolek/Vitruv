@@ -6,9 +6,11 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -63,34 +65,53 @@ public class SemanticChangeLog {
     private final List<EChange<HierarchicalId>> primaryChanges;
     private final Map<String, String> uuidMappings; // uuid → hierarchicalId
     private final Map<String, List<String>> cascadeDeletedUuids; // parentUuid → [childUuids]
+    private final Set<String> consequentialFootprints; // UUID#feature pairs from Reactions
+    private final boolean hasConsequentialFootprints; // true when footprints were explicitly provided
 
     public SemanticChangeLog(String commitSha, String branch,
                              List<EChange<HierarchicalId>> primaryChanges) {
-        this(commitSha, branch, primaryChanges, Map.of(), Map.of());
+        this(commitSha, branch, primaryChanges, Map.of(), Map.of(), null);
     }
 
     public SemanticChangeLog(String commitSha, String branch,
                              List<EChange<HierarchicalId>> primaryChanges,
                              Map<String, String> uuidMappings) {
-        this(commitSha, branch, primaryChanges, uuidMappings, Map.of());
+        this(commitSha, branch, primaryChanges, uuidMappings, Map.of(), null);
     }
 
     public SemanticChangeLog(String commitSha, String branch,
                              List<EChange<HierarchicalId>> primaryChanges,
                              Map<String, String> uuidMappings,
                              Map<String, List<String>> cascadeDeletedUuids) {
+        this(commitSha, branch, primaryChanges, uuidMappings, cascadeDeletedUuids, null);
+    }
+
+    /**
+     * Full constructor. Pass a non-null {@code consequentialFootprints} set (even if empty)
+     * to indicate that footprints were captured during commit. Pass {@code null} to indicate
+     * that footprints are not available (old-format changelog).
+     */
+    public SemanticChangeLog(String commitSha, String branch,
+                             List<EChange<HierarchicalId>> primaryChanges,
+                             Map<String, String> uuidMappings,
+                             Map<String, List<String>> cascadeDeletedUuids,
+                             Set<String> consequentialFootprints) {
         this.commitSha = Objects.requireNonNull(commitSha, "commitSha must not be null");
         this.branch = Objects.requireNonNull(branch, "branch must not be null");
         this.primaryChanges = Collections.unmodifiableList(new ArrayList<>(primaryChanges));
         this.uuidMappings = Map.copyOf(uuidMappings);
         this.cascadeDeletedUuids = cascadeDeletedUuids != null
                 ? Map.copyOf(cascadeDeletedUuids) : Map.of();
+        this.hasConsequentialFootprints = consequentialFootprints != null;
+        this.consequentialFootprints = consequentialFootprints != null
+                ? Set.copyOf(consequentialFootprints) : Set.of();
     }
 
     public String getCommitSha() { return commitSha; }
     public String getBranch() { return branch; }
     public List<EChange<HierarchicalId>> getPrimaryChanges() { return primaryChanges; }
     public Map<String, String> getUuidMappings() { return uuidMappings; }
+    public Set<String> getConsequentialFootprints() { return consequentialFootprints; }
 
     /**
      * Persists this change log as JSON DTOs.
@@ -106,9 +127,17 @@ public class SemanticChangeLog {
         Files.createDirectories(changelogDir);
         String shortSha = commitSha.substring(0, Math.min(7, commitSha.length()));
 
+        // Determine chronological commit index (count existing changelog files)
+        int index = 0;
+        if (Files.exists(changelogDir)) {
+            try (var stream = Files.list(changelogDir)) {
+                index = (int) stream.filter(f -> f.toString().endsWith(JSON_EXTENSION)).count();
+            }
+        }
+
         // Save JSON DTOs
         Path jsonPath = changelogDir.resolve(shortSha + JSON_EXTENSION);
-        saveToJson(jsonPath);
+        saveToJson(jsonPath, index);
 
         // Save metadata
         Path metaPath = changelogDir.resolve(shortSha + ".meta");
@@ -145,6 +174,36 @@ public class SemanticChangeLog {
         return dto.changes != null ? dto.changes : List.of();
     }
 
+    /**
+     * Loads consequential footprints from a changelog JSON file.
+     *
+     * @return {@code null} if the field is absent (old-format changelog),
+     *         or a (possibly empty) set of UUID#feature strings if present
+     */
+    public static Set<String> loadConsequentialFootprintsFrom(Path repoRoot, String commitSha)
+            throws IOException {
+        String shortSha = commitSha.substring(0, Math.min(7, commitSha.length()));
+        Path jsonPath = repoRoot.resolve(CHANGELOG_DIR).resolve(shortSha + JSON_EXTENSION);
+        if (!Files.exists(jsonPath)) return null;
+
+        ChangeLogDto dto = GSON.fromJson(Files.readString(jsonPath), ChangeLogDto.class);
+        if (dto.consequentialFootprints == null) return null; // field absent → old format
+        return new HashSet<>(dto.consequentialFootprints);
+    }
+
+    /**
+     * Loads the commit index from a changelog JSON file.
+     * Returns -1 if the field is absent (old-format changelog).
+     */
+    public static int loadCommitIndexFrom(Path repoRoot, String commitSha) throws IOException {
+        String shortSha = commitSha.substring(0, Math.min(7, commitSha.length()));
+        Path jsonPath = repoRoot.resolve(CHANGELOG_DIR).resolve(shortSha + JSON_EXTENSION);
+        if (!Files.exists(jsonPath)) return -1;
+
+        ChangeLogDto dto = GSON.fromJson(Files.readString(jsonPath), ChangeLogDto.class);
+        return dto.commitIndex;
+    }
+
     public static boolean existsFor(Path repoRoot, String commitSha) {
         String shortSha = commitSha.substring(0, Math.min(7, commitSha.length()));
         return Files.exists(repoRoot.resolve(CHANGELOG_DIR).resolve(shortSha + JSON_EXTENSION));
@@ -156,7 +215,7 @@ public class SemanticChangeLog {
 
     // === JSON DTO Serialization ===
 
-    private void saveToJson(Path jsonPath) throws IOException {
+    private void saveToJson(Path jsonPath, int commitIndex) throws IOException {
         List<ChangeDto> dtos = new ArrayList<>();
         for (EChange<HierarchicalId> change : primaryChanges) {
             ChangeDto dto = ChangeDto.fromEChange(change);
@@ -179,8 +238,11 @@ public class SemanticChangeLog {
         ChangeLogDto logDto = new ChangeLogDto();
         logDto.commitSha = commitSha;
         logDto.branch = branch;
+        logDto.commitIndex = commitIndex;
         logDto.changes = dtos;
         logDto.uuidMappings = uuidMappings.isEmpty() ? null : new HashMap<>(uuidMappings);
+        logDto.consequentialFootprints = hasConsequentialFootprints
+                ? new ArrayList<>(consequentialFootprints) : null;
         Files.writeString(jsonPath, GSON.toJson(logDto));
     }
 
@@ -196,8 +258,10 @@ public class SemanticChangeLog {
     static class ChangeLogDto {
         String commitSha;
         String branch;
+        int commitIndex = -1; // chronological order on branch (0-based)
         List<ChangeDto> changes;
         Map<String, String> uuidMappings; // uuid → hierarchicalId
+        List<String> consequentialFootprints; // UUID#feature pairs from Reactions
     }
 
     public static class ChangeDto {

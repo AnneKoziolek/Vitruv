@@ -288,26 +288,60 @@ public class SemanticMergeEngine {
         List<Set<String>> bDirectFP = bTransactions.stream()
                 .map(this::collectUuidFootprints).toList();
 
-        // Compute initial estimated reaction footprints by replaying each commit in isolation on base
-        CommitDependencyAnalyzer analyzer = new CommitDependencyAnalyzer(specs, interactionProvider);
+        // Collect all known UUIDs from both branches' changelogs.
+        // Only footprints for these elements matter for dependency analysis — elements
+        // created by reactions get new random UUIDs that can't conflict across branches.
+        Set<String> knownUuids = new HashSet<>();
+        for (var dto : aDtos) { if (dto.affectedElementUuid != null) knownUuids.add(dto.affectedElementUuid); }
+        for (var dto : bDtos) { if (dto.affectedElementUuid != null) knownUuids.add(dto.affectedElementUuid); }
+
+        // Load stored consequential footprints (captured at commit time)
+        List<Set<String>> aStoredFP = loadStoredFootprintsFromDir(aDirFull);
+        List<Set<String>> bStoredFP = loadStoredFootprintsFromDir(bDirFull);
+
+        boolean hasStoredFP = (aStoredFP.size() == m && bStoredFP.size() == n
+                && aStoredFP.stream().noneMatch(Objects::isNull)
+                && bStoredFP.stream().noneMatch(Objects::isNull));
+
         List<Set<String>> aReactionFP = new ArrayList<>();
         List<Set<String>> bReactionFP = new ArrayList<>();
         boolean depAnalysisOk = true;
-        try {
-            MergeTracer.trace("[INTERLEAVE] Computing reaction footprints for " + m + " A-commits and " + n + " B-commits");
+
+        if (hasStoredFP) {
+            // Use stored footprints (fast path — no replay needed).
+            // Filter to only include elements with UUIDs known from changelogs.
+            MergeTracer.trace("[INTERLEAVE] Using stored consequential footprints for "
+                    + m + " A-commits and " + n + " B-commits");
             for (int i = 0; i < m; i++) {
-                Set<String> fp = analyzer.computeReactionFootprintOnBase(aTransactions.get(i), baseDir);
-                aReactionFP.add(new HashSet<>(fp));
-                LOGGER.debug("A[{}] reactionFP = {}", i, fp);
+                Set<String> filtered = filterFootprintsByKnownUuids(aStoredFP.get(i), knownUuids);
+                aReactionFP.add(filtered);
+                LOGGER.debug("A[{}] stored reactionFP = {}", i, filtered);
             }
             for (int j = 0; j < n; j++) {
-                Set<String> fp = analyzer.computeReactionFootprintOnBase(bTransactions.get(j), baseDir);
-                bReactionFP.add(new HashSet<>(fp));
-                LOGGER.debug("B[{}] reactionFP = {}", j, fp);
+                Set<String> filtered = filterFootprintsByKnownUuids(bStoredFP.get(j), knownUuids);
+                bReactionFP.add(filtered);
+                LOGGER.debug("B[{}] stored reactionFP = {}", j, filtered);
             }
-        } catch (Exception e) {
-            LOGGER.warn("Dependency analysis failed ({}), falling back to enumeration", e.getMessage());
-            depAnalysisOk = false;
+        } else {
+            // Fallback: compute footprints by replaying each commit in isolation on base (expensive)
+            MergeTracer.trace("[INTERLEAVE] No stored footprints — computing via base replay for "
+                    + m + " A-commits and " + n + " B-commits");
+            CommitDependencyAnalyzer analyzer = new CommitDependencyAnalyzer(specs, interactionProvider);
+            try {
+                for (int i = 0; i < m; i++) {
+                    Set<String> fp = analyzer.computeReactionFootprintOnBase(aTransactions.get(i), baseDir);
+                    aReactionFP.add(new HashSet<>(fp));
+                    LOGGER.debug("A[{}] reactionFP = {}", i, fp);
+                }
+                for (int j = 0; j < n; j++) {
+                    Set<String> fp = analyzer.computeReactionFootprintOnBase(bTransactions.get(j), baseDir);
+                    bReactionFP.add(new HashSet<>(fp));
+                    LOGGER.debug("B[{}] reactionFP = {}", j, fp);
+                }
+            } catch (Exception e) {
+                LOGGER.warn("Dependency analysis failed ({}), falling back to enumeration", e.getMessage());
+                depAnalysisOk = false;
+            }
         }
 
         if (!depAnalysisOk) {
@@ -394,7 +428,7 @@ public class SemanticMergeEngine {
 
             InterleavingReplayResult replayResult = tryInterleavingWithFootprintCapture(
                     tryDir, aTransactions, bTransactions, ordering,
-                    aDtos, bDtos, baseUuidToElement);
+                    aDtos, bDtos, baseUuidToElement, knownUuids);
 
             // Guard failure: the graph-proposed ordering makes some commit inapplicable.
             // Add the discovered dependency edge and retry instead of falling back to enumeration.
@@ -523,7 +557,8 @@ public class SemanticMergeEngine {
             List<Boolean> ordering,
             List<SemanticChangeLog.ChangeDto> allADtos,
             List<SemanticChangeLog.ChangeDto> allBDtos,
-            Map<String, EObject> baseUuidToElement) throws IOException {
+            Map<String, EObject> baseUuidToElement,
+            Set<String> knownUuids) throws IOException {
 
         String uriPrefix = org.eclipse.emf.common.util.URI.createFileURI(
                 baseWorkDir.toAbsolutePath().toString()).toString();
@@ -604,9 +639,15 @@ public class SemanticMergeEngine {
                 vsum.removeChangePropagationListener(derivedCapture);
                 allApplied.addAll(txnChanges);
 
-                // Record actual reaction footprint for this commit
+                // Record actual reaction footprint for this commit.
+                // Filter to only include elements with stable UUIDs from changelogs.
+                // Newly created elements get random UUIDs that differ per replay iteration.
                 Set<String> actualFP = CommitDependencyAnalyzer.extractFootprintsFromCapture(
                         derivedCapture.getDerivedChanges(), vsum.getUuidResolver());
+                actualFP.removeIf(fp -> {
+                    String uuid = fp.contains("#") ? fp.substring(0, fp.indexOf('#')) : fp;
+                    return !knownUuids.contains(uuid);
+                });
                 if (fromA) {
                     actualAReactionFP.put(txnIndex, actualFP);
                 } else {
@@ -743,6 +784,22 @@ public class SemanticMergeEngine {
         Set<String> result = new HashSet<>(a);
         result.removeAll(b);
         return result;
+    }
+
+    /**
+     * Filters a set of UUID#feature footprints to only include entries whose UUID
+     * is in the known set. This removes footprints for elements created by reactions
+     * that get new random UUIDs on each replay iteration.
+     */
+    private static Set<String> filterFootprintsByKnownUuids(Set<String> footprints, Set<String> knownUuids) {
+        Set<String> filtered = new HashSet<>();
+        for (String fp : footprints) {
+            String uuid = fp.contains("#") ? fp.substring(0, fp.indexOf('#')) : fp;
+            if (knownUuids.contains(uuid)) {
+                filtered.add(fp);
+            }
+        }
+        return filtered;
     }
 
     /**
@@ -1443,20 +1500,60 @@ public class SemanticMergeEngine {
      * Each file represents one user commit = one transaction.
      */
     private List<List<SemanticChangeLog.ChangeDto>> loadTransactionsFromDir(Path dir) throws IOException {
-        Path clDir = dir.resolve(".vitruvius/semantic-changelogs");
-        if (!Files.exists(clDir)) return List.of();
-
+        List<String> sortedShas = listChangelogShasSorted(dir);
         List<List<SemanticChangeLog.ChangeDto>> transactions = new ArrayList<>();
-        try (var stream = Files.list(clDir)) {
-            for (Path jsonFile : stream.filter(f -> f.toString().endsWith(".changelog.json")).toList()) {
-                String shortSha = jsonFile.getFileName().toString().replace(".changelog.json", "");
-                List<SemanticChangeLog.ChangeDto> dtos = SemanticChangeLog.loadDtosFrom(dir, shortSha);
-                if (!dtos.isEmpty()) {
-                    transactions.add(dtos);
-                }
+        for (String shortSha : sortedShas) {
+            List<SemanticChangeLog.ChangeDto> dtos = SemanticChangeLog.loadDtosFrom(dir, shortSha);
+            if (!dtos.isEmpty()) {
+                transactions.add(dtos);
             }
         }
         return transactions;
+    }
+
+    /**
+     * Loads stored consequential footprints from changelog JSON files in a directory.
+     * Returns one entry per transaction (changelog file), in the same order as
+     * {@link #loadTransactionsFromDir(Path)}. Entries are {@code null} if the
+     * changelog was created by older code that did not store footprints.
+     */
+    private List<Set<String>> loadStoredFootprintsFromDir(Path dir) throws IOException {
+        List<String> sortedShas = listChangelogShasSorted(dir);
+        List<Set<String>> footprints = new ArrayList<>();
+        for (String shortSha : sortedShas) {
+            // Skip changelogs with empty DTOs (matching loadTransactionsFromDir behavior)
+            List<SemanticChangeLog.ChangeDto> dtos = SemanticChangeLog.loadDtosFrom(dir, shortSha);
+            if (dtos.isEmpty()) continue;
+
+            Set<String> fp = SemanticChangeLog.loadConsequentialFootprintsFrom(dir, shortSha);
+            footprints.add(fp); // may be null (old format)
+        }
+        return footprints;
+    }
+
+    /**
+     * Lists changelog short SHAs in chronological commit order.
+     * Uses commitIndex from the JSON if available, falls back to filename sort.
+     */
+    private List<String> listChangelogShasSorted(Path dir) throws IOException {
+        Path clDir = dir.resolve(".vitruvius/semantic-changelogs");
+        if (!Files.exists(clDir)) return List.of();
+
+        record ShaWithIndex(String shortSha, int index) {}
+        List<ShaWithIndex> entries = new ArrayList<>();
+        try (var stream = Files.list(clDir)) {
+            for (Path jsonFile : stream.filter(f -> f.toString().endsWith(".changelog.json")).toList()) {
+                String shortSha = jsonFile.getFileName().toString().replace(".changelog.json", "");
+                int idx = SemanticChangeLog.loadCommitIndexFrom(dir, shortSha);
+                entries.add(new ShaWithIndex(shortSha, idx));
+            }
+        }
+        // Sort by commitIndex if available (>= 0), fall back to filename
+        entries.sort((a, b) -> {
+            if (a.index >= 0 && b.index >= 0) return Integer.compare(a.index, b.index);
+            return a.shortSha.compareTo(b.shortSha);
+        });
+        return entries.stream().map(ShaWithIndex::shortSha).toList();
     }
 
     /**

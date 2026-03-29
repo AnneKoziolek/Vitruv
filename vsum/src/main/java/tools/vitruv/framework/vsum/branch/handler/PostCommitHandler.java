@@ -19,6 +19,8 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 
@@ -71,13 +73,28 @@ public class PostCommitHandler {
      */
     public SemanticChangelog generateChangelog(String commitSha, String branch,
                                                List<EChange<HierarchicalId>> primaryChanges) {
+        return generateChangelog(commitSha, branch, primaryChanges, Map.of(), Map.of(), Set.of());
+    }
+
+    /**
+     * Generates a semantic changelog AND persists the semantic change log (EChange-level)
+     * with full captured data including UUID mappings, cascade deletions, and consequential footprints.
+     */
+    public SemanticChangelog generateChangelog(String commitSha, String branch,
+                                               List<EChange<HierarchicalId>> primaryChanges,
+                                               Map<String, String> uuidMappings,
+                                               Map<String, List<String>> cascadeDeletedUuids,
+                                               Set<String> consequentialFootprints) {
         // Persist the EChange-level semantic change log
         if (primaryChanges != null && !primaryChanges.isEmpty()) {
             try {
-                SemanticChangeLog changeLog = new SemanticChangeLog(commitSha, branch, primaryChanges);
+                SemanticChangeLog changeLog = new SemanticChangeLog(
+                        commitSha, branch, primaryChanges,
+                        uuidMappings, cascadeDeletedUuids, consequentialFootprints);
                 changeLog.saveTo(repositoryRoot);
-                LOGGER.info("Persisted semantic change log with {} EChanges for commit {}",
-                        primaryChanges.size(), commitSha.substring(0, Math.min(7, commitSha.length())));
+                LOGGER.info("Persisted semantic change log with {} EChanges and {} consequential footprints for commit {}",
+                        primaryChanges.size(), consequentialFootprints.size(),
+                        commitSha.substring(0, Math.min(7, commitSha.length())));
             } catch (IOException e) {
                 LOGGER.warn("Failed to persist semantic change log for commit {}", commitSha, e);
             }

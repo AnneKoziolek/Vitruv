@@ -1,6 +1,8 @@
 package tools.vitruv.framework.vsum.branch.handler;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import lombok.Getter;
 import org.apache.logging.log4j.LogManager;
@@ -157,15 +159,23 @@ public class VsumPostCommitWatcher {
 
         LOGGER.info("Post-commit changelog generation triggered for commit {} on branch {}", commitShort, info.getBranch());
         try {
-            // Drain captured primary changes if available
+            // Drain all captured data if available
             List<EChange<HierarchicalId>> primaryChanges = null;
+            Map<String, String> uuidMappings = Map.of();
+            Map<String, List<String>> cascadeDeletedUuids = Map.of();
+            Set<String> consequentialFootprints = Set.of();
             if (changeLogCapture != null) {
                 primaryChanges = changeLogCapture.drainChanges();
-                LOGGER.debug("Drained {} primary changes from capture for commit {}", primaryChanges.size(), commitShort);
+                uuidMappings = changeLogCapture.drainUuidMapping();
+                cascadeDeletedUuids = changeLogCapture.drainCascadeDeletedUuids();
+                consequentialFootprints = changeLogCapture.drainConsequentialFootprints();
+                LOGGER.debug("Drained {} primary changes and {} consequential footprints from capture for commit {}",
+                        primaryChanges.size(), consequentialFootprints.size(), commitShort);
             }
 
             SemanticChangelog changelog = (primaryChanges != null && !primaryChanges.isEmpty())
-                    ? handler.generateChangelog(info.getCommitSha(), info.getBranch(), primaryChanges)
+                    ? handler.generateChangelog(info.getCommitSha(), info.getBranch(), primaryChanges,
+                            uuidMappings, cascadeDeletedUuids, consequentialFootprints)
                     : handler.generateChangelog(info.getCommitSha(), info.getBranch());
 
             Path changelogFile = repositoryRoot.resolve(".vitruvius").resolve("changelogs").resolve(commitShort + ".txt");
