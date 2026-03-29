@@ -307,7 +307,15 @@ public class SemanticMergeEngine {
         List<Set<String>> bReactionFP = new ArrayList<>();
         boolean depAnalysisOk = true;
 
-        if (hasStoredFP) {
+        if (!hasStoredFP) {
+            LOGGER.warn("Changelogs do not contain stored consequential footprints. "
+                    + "Ensure changelogs are created with ChangeLogCapture.drainConsequentialFootprints().");
+            // Fall back to empty footprints — the fixpoint loop will discover them via replay
+            MergeTracer.trace("[INTERLEAVE] No stored footprints — starting with empty estimates for "
+                    + m + " A-commits and " + n + " B-commits");
+            for (int i = 0; i < m; i++) aReactionFP.add(new HashSet<>());
+            for (int j = 0; j < n; j++) bReactionFP.add(new HashSet<>());
+        } else {
             // Use stored footprints (fast path — no replay needed).
             // Filter to only include elements with UUIDs known from changelogs.
             MergeTracer.trace("[INTERLEAVE] Using stored consequential footprints for "
@@ -322,31 +330,6 @@ public class SemanticMergeEngine {
                 bReactionFP.add(filtered);
                 LOGGER.debug("B[{}] stored reactionFP = {}", j, filtered);
             }
-        } else {
-            // Fallback: compute footprints by replaying each commit in isolation on base (expensive)
-            MergeTracer.trace("[INTERLEAVE] No stored footprints — computing via base replay for "
-                    + m + " A-commits and " + n + " B-commits");
-            CommitDependencyAnalyzer analyzer = new CommitDependencyAnalyzer(specs, interactionProvider);
-            try {
-                for (int i = 0; i < m; i++) {
-                    Set<String> fp = analyzer.computeReactionFootprintOnBase(aTransactions.get(i), baseDir);
-                    aReactionFP.add(new HashSet<>(fp));
-                    LOGGER.debug("A[{}] reactionFP = {}", i, fp);
-                }
-                for (int j = 0; j < n; j++) {
-                    Set<String> fp = analyzer.computeReactionFootprintOnBase(bTransactions.get(j), baseDir);
-                    bReactionFP.add(new HashSet<>(fp));
-                    LOGGER.debug("B[{}] reactionFP = {}", j, fp);
-                }
-            } catch (Exception e) {
-                LOGGER.warn("Dependency analysis failed ({}), falling back to enumeration", e.getMessage());
-                depAnalysisOk = false;
-            }
-        }
-
-        if (!depAnalysisOk) {
-            return mergeWithInterleavingEnumeration(baseDir, aTransactions, bTransactions,
-                    aDtos, bDtos, baseUuidToElement, m, n);
         }
 
         // Iterative fixpoint loop
@@ -642,7 +625,7 @@ public class SemanticMergeEngine {
                 // Record actual reaction footprint for this commit.
                 // Filter to only include elements with stable UUIDs from changelogs.
                 // Newly created elements get random UUIDs that differ per replay iteration.
-                Set<String> actualFP = CommitDependencyAnalyzer.extractFootprintsFromCapture(
+                Set<String> actualFP = extractFootprintsFromCapture(
                         derivedCapture.getDerivedChanges(), vsum.getUuidResolver());
                 actualFP.removeIf(fp -> {
                     String uuid = fp.contains("#") ? fp.substring(0, fp.indexOf('#')) : fp;
@@ -784,6 +767,40 @@ public class SemanticMergeEngine {
         Set<String> result = new HashSet<>(a);
         result.removeAll(b);
         return result;
+    }
+
+    /**
+     * Extracts reaction footprints from a set of {@link PropagatedChange} objects captured
+     * during a replay.
+     *
+     * @param derivedChanges the propagated changes captured during replay
+     * @param uuidResolver   UUID resolver for the VSUM used during replay
+     * @return set of UUID#feature strings written by reactions
+     */
+    static Set<String> extractFootprintsFromCapture(
+            List<PropagatedChange> derivedChanges,
+            UuidResolver uuidResolver) {
+
+        Set<String> footprints = new HashSet<>();
+        for (PropagatedChange pc : derivedChanges) {
+            VitruviusChange<EObject> consequential = pc.getConsequentialChanges();
+            if (consequential == null || !consequential.containsConcreteChange()) continue;
+            for (EChange<EObject> ec : consequential.getEChanges()) {
+                if (!(ec instanceof tools.vitruv.change.atomic.feature.FeatureEChange<EObject, ?> fc))
+                    continue;
+                EObject element = fc.getAffectedElement();
+                String featureName = fc.getAffectedFeature() != null
+                        ? fc.getAffectedFeature().getName() : null;
+                if (element == null || featureName == null) continue;
+                try {
+                    String uuid = uuidResolver.getUuid(element).toString();
+                    footprints.add(uuid + "#" + featureName);
+                } catch (IllegalStateException e) {
+                    // Element not in resolver (transiently created) — skip
+                }
+            }
+        }
+        return footprints;
     }
 
     /**
