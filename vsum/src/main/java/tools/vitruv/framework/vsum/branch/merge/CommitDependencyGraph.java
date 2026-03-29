@@ -29,7 +29,24 @@ public class CommitDependencyGraph {
     // In-degree for Kahn's algorithm
     private final int[] inDegree;
 
+    /**
+     * Creates a dependency graph with sequential intra-branch ordering
+     * (a_0 → a_1 → ... and b_0 → b_1 → ...).
+     */
     public CommitDependencyGraph(int m, int n) {
+        this(m, n, IntraBranchDependencyMode.SEQUENTIAL, List.of());
+    }
+
+    /**
+     * Creates a dependency graph with configurable intra-branch ordering.
+     *
+     * @param m                number of A-commits
+     * @param n                number of B-commits
+     * @param mode             how intra-branch edges are determined
+     * @param intraBranchEdges explicit intra-branch edges (used when mode is CALCULATED)
+     */
+    public CommitDependencyGraph(int m, int n, IntraBranchDependencyMode mode,
+                                  List<int[]> intraBranchEdges) {
         this.m = m;
         this.n = n;
         this.total = m + n;
@@ -38,9 +55,14 @@ public class CommitDependencyGraph {
         for (int i = 0; i < total; i++) {
             edges.add(new HashSet<>());
         }
-        // Add intra-branch ordering: a_0 → a_1 → ... and b_0 → b_1 → ...
-        for (int i = 0; i < m - 1; i++) addEdge(i, i + 1);
-        for (int j = 0; j < n - 1; j++) addEdge(m + j, m + j + 1);
+        if (mode == IntraBranchDependencyMode.SEQUENTIAL) {
+            // Add sequential intra-branch ordering: a_0 → a_1 → ... and b_0 → b_1 → ...
+            for (int i = 0; i < m - 1; i++) addEdge(i, i + 1);
+            for (int j = 0; j < n - 1; j++) addEdge(m + j, m + j + 1);
+        } else {
+            // Add only the explicitly computed intra-branch edges
+            for (int[] edge : intraBranchEdges) addEdge(edge[0], edge[1]);
+        }
     }
 
     /** Returns the node index for A-commit i (0-indexed). */

@@ -167,8 +167,22 @@ public class SemanticMergeCommand {
             Collection<ChangePropagationSpecification> specs,
             InteractionResultProvider interactionProvider,
             ConflictResolutionProvider conflictResolutionProvider) throws Exception {
+        return executeWithInterleaving(repoRoot, branchA, branchB, specs,
+                interactionProvider, conflictResolutionProvider,
+                IntraBranchDependencyMode.CALCULATED);
+    }
 
-        LOGGER.info("Interleaving semantic merge: {} <-> {}", branchA, branchB);
+    public SemanticMergeResult executeWithInterleaving(
+            Path repoRoot,
+            String branchA,
+            String branchB,
+            Collection<ChangePropagationSpecification> specs,
+            InteractionResultProvider interactionProvider,
+            ConflictResolutionProvider conflictResolutionProvider,
+            IntraBranchDependencyMode intraBranchMode) throws Exception {
+
+        LOGGER.info("Interleaving semantic merge: {} <-> {} (intra-branch: {})",
+                branchA, branchB, intraBranchMode);
 
         String branchASha;
         String branchBSha;
@@ -194,7 +208,7 @@ public class SemanticMergeCommand {
         }
 
         SemanticMergeEngine engine = new SemanticMergeEngine(
-                repoRoot, specs, interactionProvider, conflictResolutionProvider);
+                repoRoot, specs, interactionProvider, conflictResolutionProvider, intraBranchMode);
         SemanticMergeResult result = engine.mergeWithInterleaving(baseSha, branchASha, branchBSha);
 
         LOGGER.info("Interleaving merge result: {}", result);

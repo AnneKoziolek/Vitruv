@@ -5,6 +5,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -65,21 +66,32 @@ public class SemanticMergeEngine {
     private final Collection<ChangePropagationSpecification> specs;
     private final InteractionResultProvider interactionProvider;
     private final ConflictResolutionProvider conflictResolutionProvider;
+    private final IntraBranchDependencyMode intraBranchMode;
 
     public SemanticMergeEngine(Path repoRoot,
                                 Collection<ChangePropagationSpecification> specs,
                                 InteractionResultProvider interactionProvider) {
-        this(repoRoot, specs, interactionProvider, null);
+        this(repoRoot, specs, interactionProvider, null, IntraBranchDependencyMode.CALCULATED);
     }
 
     public SemanticMergeEngine(Path repoRoot,
                                 Collection<ChangePropagationSpecification> specs,
                                 InteractionResultProvider interactionProvider,
                                 ConflictResolutionProvider conflictResolutionProvider) {
+        this(repoRoot, specs, interactionProvider, conflictResolutionProvider,
+                IntraBranchDependencyMode.CALCULATED);
+    }
+
+    public SemanticMergeEngine(Path repoRoot,
+                                Collection<ChangePropagationSpecification> specs,
+                                InteractionResultProvider interactionProvider,
+                                ConflictResolutionProvider conflictResolutionProvider,
+                                IntraBranchDependencyMode intraBranchMode) {
         this.repoRoot = repoRoot;
         this.specs = specs;
         this.interactionProvider = interactionProvider;
         this.conflictResolutionProvider = conflictResolutionProvider;
+        this.intraBranchMode = intraBranchMode;
     }
 
     /**
@@ -340,16 +352,16 @@ public class SemanticMergeEngine {
             LOGGER.info("[INTERLEAVE] Iteration {} / {}", iteration + 1, maxIterations);
             MergeTracer.trace("[INTERLEAVE] Dependency-graph iteration " + (iteration + 1));
 
-            // Build dependency graph
-            CommitDependencyGraph graph = new CommitDependencyGraph(m, n);
+            // Build dependency graph with configurable intra-branch edges
+            List<int[]> intraBranchEdges = (intraBranchMode == IntraBranchDependencyMode.CALCULATED)
+                    ? computeIntraBranchEdges(m, n, aDirectFP, bDirectFP, aReactionFP, bReactionFP)
+                    : List.of(); // sequential mode adds edges in the constructor
+            CommitDependencyGraph graph = new CommitDependencyGraph(m, n, intraBranchMode, intraBranchEdges);
 
+            // Add inter-branch edges based on footprint overlaps
             for (int i = 0; i < m; i++) {
                 for (int j = 0; j < n; j++) {
                     // If a_i's reaction touches b_j's direct changes: a_i must precede b_j.
-                    // Reason: replaying a_i FIRST fires its reaction (derives the value), then
-                    // b_j's user change overwrites that derived value → USER_VS_DERIVED_WARNING (non-blocking).
-                    // If b_j came first, b_j's user change would later be overwritten by a_i's reaction
-                    // → INDIRECT_CONFLICT (blocking). So a_i → b_j.
                     Set<String> aRxnOverlapBDirect = new HashSet<>(aReactionFP.get(i));
                     aRxnOverlapBDirect.retainAll(bDirectFP.get(j));
                     if (!aRxnOverlapBDirect.isEmpty()) {
@@ -358,7 +370,6 @@ public class SemanticMergeEngine {
                     }
 
                     // If b_j's reaction touches a_i's direct changes: b_j must precede a_i.
-                    // Reason: same logic in reverse — b_j first, reaction derives, then a_i user overwrites. b_j → a_i.
                     Set<String> bRxnOverlapADirect = new HashSet<>(bReactionFP.get(j));
                     bRxnOverlapADirect.retainAll(aDirectFP.get(i));
                     if (!bRxnOverlapADirect.isEmpty()) {
@@ -817,6 +828,77 @@ public class SemanticMergeEngine {
             }
         }
         return filtered;
+    }
+
+    /**
+     * Computes intra-branch dependency edges from footprint overlaps.
+     * Two commits on the same branch need an ordering edge if:
+     * <ul>
+     *   <li>Write-write: both modify the same element-feature pair</li>
+     *   <li>Consequential-write: earlier commit's reaction writes what later commit originally changes</li>
+     *   <li>Write-consequential: later commit's reaction writes what earlier commit originally changes</li>
+     * </ul>
+     * Commits with no footprint overlap are independent and can be freely reordered.
+     */
+    private List<int[]> computeIntraBranchEdges(
+            int m, int n,
+            List<Set<String>> aDirectFP, List<Set<String>> bDirectFP,
+            List<Set<String>> aReactionFP, List<Set<String>> bReactionFP) {
+
+        List<int[]> edges = new ArrayList<>();
+
+        // Branch A: for each pair (i, j) where i < j
+        for (int i = 0; i < m; i++) {
+            for (int j = i + 1; j < m; j++) {
+                boolean iBeforeJ = hasFootprintOverlap(aDirectFP.get(i), aReactionFP.get(i),
+                        aDirectFP.get(j), aReactionFP.get(j));
+                boolean jBeforeI = hasFootprintOverlap(aDirectFP.get(j), aReactionFP.get(j),
+                        aDirectFP.get(i), aReactionFP.get(i));
+
+                if (iBeforeJ || jBeforeI) {
+                    // There is a dependency; preserve original order (i before j)
+                    edges.add(new int[]{i, j});
+                    LOGGER.debug("Intra-branch edge A[{}] → A[{}] (footprint overlap)", i, j);
+                }
+                // If neither direction has overlap, commits are independent — no edge
+            }
+        }
+
+        // Branch B: for each pair (i, j) where i < j
+        for (int i = 0; i < n; i++) {
+            for (int j = i + 1; j < n; j++) {
+                boolean iBeforeJ = hasFootprintOverlap(bDirectFP.get(i), bReactionFP.get(i),
+                        bDirectFP.get(j), bReactionFP.get(j));
+                boolean jBeforeI = hasFootprintOverlap(bDirectFP.get(j), bReactionFP.get(j),
+                        bDirectFP.get(i), bReactionFP.get(i));
+
+                if (iBeforeJ || jBeforeI) {
+                    edges.add(new int[]{m + i, m + j});
+                    LOGGER.debug("Intra-branch edge B[{}] → B[{}] (footprint overlap)", i, j);
+                }
+            }
+        }
+
+        return edges;
+    }
+
+    /**
+     * Checks if two commits have overlapping footprints that require ordering.
+     * Returns true if commit "earlier" must precede "later" because:
+     * - Their original footprints overlap (write-write)
+     * - Earlier's consequential footprint overlaps later's original (consequential-write)
+     * - Later's consequential footprint overlaps earlier's original (write-consequential)
+     */
+    private static boolean hasFootprintOverlap(
+            Set<String> earlierDirect, Set<String> earlierReaction,
+            Set<String> laterDirect, Set<String> laterReaction) {
+        // Write-write: both modify the same element-feature
+        if (!Collections.disjoint(earlierDirect, laterDirect)) return true;
+        // Consequential-write: earlier's reaction writes what later originally changes
+        if (!Collections.disjoint(earlierReaction, laterDirect)) return true;
+        // Write-consequential: later's reaction writes what earlier originally changes
+        if (!Collections.disjoint(laterReaction, earlierDirect)) return true;
+        return false;
     }
 
     /**
