@@ -468,15 +468,19 @@ public class SemanticMergeEngine {
                         aDtos, bDtos, m, n, hidToUuid);
             }
 
-            // Check if actual reaction footprints add new entries (monotone union)
-            boolean fixedPoint = true;
+            // Check whether the actual consequential footprints from this replay match the
+            // estimates used to build the dependency graph. If they do, the graph was correct
+            // for this ordering and the merge is complete. If not, the estimates are enlarged
+            // (monotone union) and the graph must be rebuilt with the new footprints.
+            boolean footprintsStabilized = true;
             for (int i = 0; i < m; i++) {
                 Set<String> actual = replayResult.actualAReactionFP().get(i);
                 if (actual != null && !aReactionFP.get(i).containsAll(actual)) {
                     LOGGER.info("[INTERLEAVE] A[{}] gained new reaction footprint entries: {}",
                             i, minus(actual, aReactionFP.get(i)));
+                    // Enlarge the estimate (monotone union) — footprints only grow, never shrink
                     aReactionFP.get(i).addAll(actual);
-                    fixedPoint = false;
+                    footprintsStabilized = false;
                 }
             }
             for (int j = 0; j < n; j++) {
@@ -485,13 +489,15 @@ public class SemanticMergeEngine {
                     LOGGER.info("[INTERLEAVE] B[{}] gained new reaction footprint entries: {}",
                             j, minus(actual, bReactionFP.get(j)));
                     bReactionFP.get(j).addAll(actual);
-                    fixedPoint = false;
+                    footprintsStabilized = false;
                 }
             }
 
-            if (fixedPoint) {
-                LOGGER.info("[INTERLEAVE] Fixed point reached at iteration {}", iteration + 1);
-                MergeTracer.trace("[INTERLEAVE] Fixed point at iteration " + (iteration + 1));
+            if (footprintsStabilized) {
+                // Estimates matched actuals: the dependency graph was correct for this ordering,
+                // and all commits replayed successfully. The merge is complete.
+                LOGGER.info("[INTERLEAVE] Footprints stabilized at iteration {}", iteration + 1);
+                MergeTracer.trace("[INTERLEAVE] Footprints stabilized at iteration " + (iteration + 1));
                 SemanticMergeResult result = replayResult.result();
                 return SemanticMergeResult.success(
                         result.getAppliedChanges(), List.of(),
