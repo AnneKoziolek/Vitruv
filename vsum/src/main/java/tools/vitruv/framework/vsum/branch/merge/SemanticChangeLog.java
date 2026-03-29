@@ -175,6 +175,20 @@ public class SemanticChangeLog {
     }
 
     /**
+     * Loads UUID-to-HierarchicalId mappings from a changelog JSON file.
+     * Used for UUID-based element resolution during interleaving replay.
+     */
+    public static Map<String, String> loadUuidMappingsFrom(Path repoRoot, String commitSha)
+            throws IOException {
+        String shortSha = commitSha.substring(0, Math.min(7, commitSha.length()));
+        Path jsonPath = repoRoot.resolve(CHANGELOG_DIR).resolve(shortSha + JSON_EXTENSION);
+        if (!Files.exists(jsonPath)) return Map.of();
+
+        ChangeLogDto dto = GSON.fromJson(Files.readString(jsonPath), ChangeLogDto.class);
+        return dto.uuidMappings != null ? dto.uuidMappings : Map.of();
+    }
+
+    /**
      * Loads consequential footprints from a changelog JSON file.
      *
      * @return {@code null} if the field is absent (old-format changelog),

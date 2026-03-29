@@ -271,6 +271,14 @@ public class SemanticMergeEngine {
         List<List<SemanticChangeLog.ChangeDto>> aTransactions = loadTransactionsFromDir(aDirFull);
         List<List<SemanticChangeLog.ChangeDto>> bTransactions = loadTransactionsFromDir(bDirFull);
 
+        // Load UUID mappings for UUID-based element resolution fallback
+        Map<String, String> aUuidMappings = loadUuidMappingsFromDir(aDirFull);
+        Map<String, String> bUuidMappings = loadUuidMappingsFromDir(bDirFull);
+        // Merge and reverse: hid → uuid (for both branches)
+        Map<String, String> allUuidMappings = new HashMap<>(aUuidMappings);
+        allUuidMappings.putAll(bUuidMappings);
+        Map<String, String> hidToUuid = reverseUuidMappings(allUuidMappings);
+
         List<SemanticChangeLog.ChangeDto> aDtos = aTransactions.stream().flatMap(List::stream).toList();
         List<SemanticChangeLog.ChangeDto> bDtos = bTransactions.stream().flatMap(List::stream).toList();
 
@@ -417,7 +425,7 @@ public class SemanticMergeEngine {
 
             InterleavingReplayResult replayResult = tryInterleavingWithFootprintCapture(
                     tryDir, aTransactions, bTransactions, ordering,
-                    aDtos, bDtos, knownUuids);
+                    aDtos, bDtos, knownUuids, hidToUuid);
 
             // Guard failure: the graph-proposed ordering makes some commit inapplicable.
             // Add the discovered dependency edge and retry instead of falling back to enumeration.
@@ -457,7 +465,7 @@ public class SemanticMergeEngine {
                 }
                 MergeTracer.trace("[INTERLEAVE] Guard failure → enumeration fallback");
                 return mergeWithInterleavingEnumeration(baseDir, aTransactions, bTransactions,
-                        aDtos, bDtos, m, n);
+                        aDtos, bDtos, m, n, hidToUuid);
             }
 
             // Check if actual reaction footprints add new entries (monotone union)
@@ -533,7 +541,8 @@ public class SemanticMergeEngine {
             List<Boolean> ordering,
             List<SemanticChangeLog.ChangeDto> allADtos,
             List<SemanticChangeLog.ChangeDto> allBDtos,
-            Set<String> knownUuids) throws IOException {
+            Set<String> knownUuids,
+            Map<String, String> hidToUuid) throws IOException {
 
         String uriPrefix = org.eclipse.emf.common.util.URI.createFileURI(
                 baseWorkDir.toAbsolutePath().toString()).toString();
@@ -577,7 +586,7 @@ public class SemanticMergeEngine {
                 DerivedChangeCapture derivedCapture = new DerivedChangeCapture();
                 vsum.addChangePropagationListener(derivedCapture);
 
-                replayChanges(vsum, txnChanges);
+                replayChanges(vsum, txnChanges, hidToUuid);
 
                 vsum.removeChangePropagationListener(derivedCapture);
                 allApplied.addAll(txnChanges);
@@ -604,6 +613,8 @@ public class SemanticMergeEngine {
             LOGGER.warn("[INTERLEAVE] Ordering {} is inapplicable (guard failure): {}",
                     orderingToString(ordering), e.getMessage());
             LOGGER.debug("[INTERLEAVE] Guard failure details", e);
+            MergeTracer.trace("[INTERLEAVE] Guard failure: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
             vsum.dispose();
             int lastOtherBranchIdx = lastStepFromA ? (bIdx - 1) : (aIdx - 1);
             GuardFailureInfo gf = (lastOtherBranchIdx >= 0)
@@ -624,7 +635,8 @@ public class SemanticMergeEngine {
             List<List<SemanticChangeLog.ChangeDto>> bTransactions,
             List<SemanticChangeLog.ChangeDto> aDtos,
             List<SemanticChangeLog.ChangeDto> bDtos,
-            int m, int n) throws IOException {
+            int m, int n,
+            Map<String, String> hidToUuid) throws IOException {
 
         // Generate candidate orderings
         InterleavingGenerator generator = new InterleavingGenerator();
@@ -643,7 +655,7 @@ public class SemanticMergeEngine {
 
             SemanticMergeResult result = tryInterleaving(
                     tryDir, aTransactions, bTransactions, ordering,
-                    aDtos, bDtos);
+                    aDtos, bDtos, hidToUuid);
 
             if (result == null) {
                 // Guard failure: this ordering makes some commit inapplicable — skip it
@@ -820,7 +832,8 @@ public class SemanticMergeEngine {
             List<List<SemanticChangeLog.ChangeDto>> bTransactions,
             List<Boolean> ordering,
             List<SemanticChangeLog.ChangeDto> allADtos,
-            List<SemanticChangeLog.ChangeDto> allBDtos) throws IOException {
+            List<SemanticChangeLog.ChangeDto> allBDtos,
+            Map<String, String> hidToUuid) throws IOException {
 
         String uriPrefix = org.eclipse.emf.common.util.URI.createFileURI(
                 baseWorkDir.toAbsolutePath().toString()).toString();
@@ -849,7 +862,7 @@ public class SemanticMergeEngine {
                 List<EChange<HierarchicalId>> txnChanges = deserializer.deserializeAll(txnDtos);
                 if (txnChanges.isEmpty()) continue;
 
-                replayChanges(vsum, txnChanges);
+                replayChanges(vsum, txnChanges, hidToUuid);
                 allApplied.addAll(txnChanges);
 
                 LOGGER.debug("Step {}: replayed {} changes from {}",
@@ -1248,6 +1261,19 @@ public class SemanticMergeEngine {
     @SuppressWarnings("unchecked")
     static void replayChanges(InternalVirtualModel targetVsum,
                                List<EChange<HierarchicalId>> changes) {
+        replayChanges(targetVsum, changes, Map.of());
+    }
+
+    /**
+     * Replays changes with UUID-based fallback resolution.
+     *
+     * @param hidToUuidFallback mapping from normalized HierarchicalId string → UUID string,
+     *        built from the changelog's uuidMappings (reversed). Used when HierarchicalId
+     *        path resolution fails because the model structure changed during interleaving.
+     */
+    static void replayChanges(InternalVirtualModel targetVsum,
+                               List<EChange<HierarchicalId>> changes,
+                               Map<String, String> hidToUuidFallback) {
 
         // Create a ChangeRecordingView on all model objects
         var selector = targetVsum.createSelector(
@@ -1262,9 +1288,23 @@ public class SemanticMergeEngine {
                 .eResource().getResourceSet();
         var idResolver = tools.vitruv.change.atomic.hid.internal.HierarchicalIdResolver.create(viewRs);
 
+        // Build UUID-to-EObject fallback map: for each UUID string in the changelog,
+        // find the corresponding EObject in the current VSUM state.
+        Map<String, EObject> uuidToElement = buildUuidMap(targetVsum);
+        // Build HID-to-EObject fallback map: hid string → EObject via UUID bridge
+        Map<String, EObject> hidFallback = new HashMap<>();
+        for (var entry : hidToUuidFallback.entrySet()) {
+            String hidStr = entry.getKey();
+            String uuidStr = entry.getValue();
+            EObject element = uuidToElement.get(uuidStr);
+            if (element != null) {
+                hidFallback.put(hidStr, element);
+            }
+        }
+
         // Apply each change using EMF reflective API (triggers notifications for ChangeRecorder)
         for (EChange<HierarchicalId> eChange : changes) {
-            applyChangeReflectively(eChange, idResolver);
+            applyChangeReflectively(eChange, idResolver, hidFallback);
         }
 
         // Commit: ChangeRecordingView captured EMF notifications → propagateChange → reactions fire
@@ -1289,36 +1329,88 @@ public class SemanticMergeEngine {
      *       reports a {@link MergeConflict.ConflictType#REPLAY_APPLICABILITY} conflict.</li>
      * </ul>
      */
+    /**
+     * Resolves an element by HierarchicalId, falling back to a prebuilt UUID-to-EObject
+     * map if the path fails. UUID-based fallback is needed during interleaving replay:
+     * when replaying from the common ancestor, reactions from earlier transactions may
+     * have changed model structure, making the HierarchicalId paths invalid.
+     */
+    /**
+     * Resolves an element by HierarchicalId with UUID verification and fallback.
+     *
+     * <ol>
+     *   <li>Try HierarchicalId (positional path) resolution (fast path).</li>
+     *   <li>If the HID has a known UUID mapping, verify the resolved element's UUID matches.
+     *       If it doesn't (positional path pointed to wrong element due to model changes),
+     *       fall through to UUID fallback.</li>
+     *   <li>UUID fallback: look up the element directly by UUID from a prebuilt map.</li>
+     * </ol>
+     *
+     * @param hidFallback mapping from HierarchicalId string → EObject, built at replay time
+     *        by bridging the changelog's uuid→hid mapping with the VSUM's uuid→EObject mapping
+     */
+    private static EObject resolveElement(HierarchicalId hid,
+                                           tools.vitruv.change.atomic.hid.internal.HierarchicalIdResolver idResolver,
+                                           Map<String, EObject> hidFallback) {
+        if (hid == null) return null;
+        String hidStr = hid.getId();
+
+        // Determine the expected EObject from UUID (if available in fallback map)
+        EObject expectedByUuid = hidFallback != null ? hidFallback.get(hidStr) : null;
+
+        // Try HierarchicalId resolution first (fast path)
+        try {
+            EObject result = idResolver.getEObject(hid);
+            if (result != null) {
+                // Verify UUID match: if we know the expected element via UUID,
+                // check that the HID resolved to the same object
+                if (expectedByUuid != null && result != expectedByUuid) {
+                    LOGGER.debug("HID '{}' resolved to wrong element (UUID mismatch), using UUID fallback",
+                            hidStr);
+                    return expectedByUuid;
+                }
+                return result;
+            }
+        } catch (Exception e) {
+            // Fall through to UUID fallback
+        }
+
+        // UUID fallback
+        if (expectedByUuid != null) {
+            LOGGER.debug("UUID fallback resolved '{}'", hidStr);
+            return expectedByUuid;
+        }
+        return null;
+    }
+
     @SuppressWarnings("unchecked")
     private static void applyChangeReflectively(EChange<HierarchicalId> eChange,
-                                          tools.vitruv.change.atomic.hid.internal.HierarchicalIdResolver idResolver) {
+                                          tools.vitruv.change.atomic.hid.internal.HierarchicalIdResolver idResolver,
+                                          Map<String, EObject> hidFallback) {
         if (eChange instanceof tools.vitruv.change.atomic.eobject.CreateEObject<HierarchicalId> ce) {
             EObject created = EcoreUtil.create(ce.getAffectedEObjectType());
             idResolver.getAndUpdateId(created);
 
         } else if (eChange instanceof tools.vitruv.change.atomic.feature.reference.InsertEReference<HierarchicalId> ir) {
-            EObject container = idResolver.getEObject(ir.getAffectedElement());
-            EObject newElement = idResolver.getEObject(ir.getNewValue());
+            EObject container = resolveElement(ir.getAffectedElement(), idResolver, hidFallback);
+            EObject newElement = resolveElement(ir.getNewValue(), idResolver, hidFallback);
             var list = (List<EObject>) container.eGet(ir.getAffectedFeature());
-            if (ir.getIndex() >= 0 && ir.getIndex() <= list.size()) {
-                list.add(ir.getIndex(), newElement);
-            } else {
-                list.add(newElement);
-            }
+            // Set-based semantics: always append, ignore recorded index.
+            // Multi-valued features are treated as sets for merge purposes.
+            list.add(newElement);
 
         } else if (eChange instanceof tools.vitruv.change.atomic.feature.attribute.ReplaceSingleValuedEAttribute<HierarchicalId, ?> rsa) {
-            try {
-                EObject element = idResolver.getEObject(rsa.getAffectedElement());
-                element.eSet(rsa.getAffectedFeature(), rsa.getNewValue());
-            } catch (Exception e) {
-                // Element may have been deleted on the target branch — rethrow as guard failure
+            EObject element = resolveElement(rsa.getAffectedElement(), idResolver, hidFallback);
+            if (element == null) {
                 throw new IllegalStateException("Cannot apply ReplaceSingleValuedEAttribute: "
-                        + "element not found for " + rsa.getAffectedElement(), e);
+                        + "element not found for " + rsa.getAffectedElement());
             }
+            element.eSet(rsa.getAffectedFeature(), rsa.getNewValue());
 
         } else if (eChange instanceof tools.vitruv.change.atomic.feature.reference.RemoveEReference<HierarchicalId> rr) {
             try {
-                EObject container = idResolver.getEObject(rr.getAffectedElement());
+                EObject container = resolveElement(rr.getAffectedElement(), idResolver, hidFallback);
+                if (container == null) throw new Exception("Container not found");
                 var list = (List<EObject>) container.eGet(rr.getAffectedFeature());
                 if (rr.getIndex() >= 0 && rr.getIndex() < list.size()) {
                     list.remove(rr.getIndex());
@@ -1329,30 +1421,25 @@ public class SemanticMergeEngine {
             }
 
         } else if (eChange instanceof tools.vitruv.change.atomic.eobject.DeleteEObject<HierarchicalId> de) {
-            try {
-                EObject element = idResolver.getEObject(de.getAffectedElement());
-                if (element != null) {
-                    EcoreUtil.remove(element);
-                } else {
-                    LOGGER.debug("DeleteEObject: element already removed (null): {}",
-                            de.getAffectedElement());
-                }
-            } catch (Exception e) {
-                // Element may have been removed by a prior RemoveEReference in the same
-                // transaction (containment removal already detached it from the model).
+            EObject element = resolveElement(de.getAffectedElement(), idResolver, hidFallback);
+            if (element != null) {
+                EcoreUtil.remove(element);
+            } else {
                 LOGGER.debug("DeleteEObject: element not resolvable (already removed): {}",
                         de.getAffectedElement());
             }
 
         } else if (eChange instanceof tools.vitruv.change.atomic.feature.attribute.InsertEAttributeValue<HierarchicalId, ?> ia) {
-            EObject element = idResolver.getEObject(ia.getAffectedElement());
+            EObject element = resolveElement(ia.getAffectedElement(), idResolver, hidFallback);
             var list = (List<Object>) element.eGet(ia.getAffectedFeature());
-            list.add(ia.getIndex(), ia.getNewValue());
+            // Set-based semantics: always append, ignore recorded index.
+            list.add(ia.getNewValue());
 
         } else if (eChange instanceof tools.vitruv.change.atomic.root.InsertRootEObject<HierarchicalId> iro) {
-            EObject newRoot = idResolver.getEObject(iro.getNewValue());
+            EObject newRoot = resolveElement(iro.getNewValue(), idResolver, hidFallback);
+            // Set-based semantics: always append, ignore recorded index.
             idResolver.getResource(org.eclipse.emf.common.util.URI.createURI(iro.getUri()))
-                    .getContents().add(iro.getIndex(), newRoot);
+                    .getContents().add(newRoot);
         }
     }
 
@@ -1433,6 +1520,30 @@ public class SemanticMergeEngine {
             }
         }
         return transactions;
+    }
+
+    /**
+     * Loads all UUID→HierarchicalId mappings from changelog JSON files in a directory.
+     * Returns a single aggregated map (uuid string → hid string).
+     */
+    private Map<String, String> loadUuidMappingsFromDir(Path dir) throws IOException {
+        List<String> sortedShas = listChangelogShasSorted(dir);
+        Map<String, String> allMappings = new HashMap<>();
+        for (String shortSha : sortedShas) {
+            allMappings.putAll(SemanticChangeLog.loadUuidMappingsFrom(dir, shortSha));
+        }
+        return allMappings;
+    }
+
+    /**
+     * Reverses a UUID→HierarchicalId mapping to HierarchicalId→UUID.
+     */
+    private static Map<String, String> reverseUuidMappings(Map<String, String> uuidToHid) {
+        Map<String, String> hidToUuid = new HashMap<>();
+        for (var entry : uuidToHid.entrySet()) {
+            hidToUuid.put(entry.getValue(), entry.getKey());
+        }
+        return hidToUuid;
     }
 
     /**
@@ -1640,7 +1751,7 @@ public class SemanticMergeEngine {
      * Used for element existence checks and value snapshots without needing to construct
      * package-private {@code Uuid} objects.
      */
-    private Map<String, EObject> buildUuidMap(InternalVirtualModel vsum) {
+    private static Map<String, EObject> buildUuidMap(InternalVirtualModel vsum) {
         Map<String, EObject> map = new java.util.HashMap<>();
         UuidResolver resolver = vsum.getUuidResolver();
         for (var sourceModel : vsum.getViewSourceModels()) {
