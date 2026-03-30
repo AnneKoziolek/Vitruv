@@ -1390,8 +1390,18 @@ public class SemanticMergeEngine {
         if (hid == null) return null;
         String hidStr = hid.getId();
 
-        // Determine the expected EObject from UUID (if available in fallback map)
-        EObject expectedByUuid = hidFallback != null ? hidFallback.get(hidStr) : null;
+        // Determine the expected EObject from UUID (if available in fallback map).
+        // Try both the full HID string and the bare fragment, because changelog
+        // uuidMappings store bare fragments (e.g., "/0/@brakeComponents.2") while
+        // deserialized EChanges use full URIs (e.g., "file:///tmp/.../model#/0/@brakeComponents.2").
+        EObject expectedByUuid = null;
+        if (hidFallback != null) {
+            expectedByUuid = hidFallback.get(hidStr);
+            if (expectedByUuid == null && hidStr.contains("#")) {
+                String fragment = hidStr.substring(hidStr.indexOf('#') + 1);
+                expectedByUuid = hidFallback.get(fragment);
+            }
+        }
 
         // Try HierarchicalId resolution first (fast path)
         try {
