@@ -1448,7 +1448,16 @@ public class SemanticMergeEngine {
                 throw new IllegalStateException("Cannot apply ReplaceSingleValuedEAttribute: "
                         + "element not found for " + rsa.getAffectedElement());
             }
-            element.eSet(rsa.getAffectedFeature(), rsa.getNewValue());
+            var feature = rsa.getAffectedFeature();
+            if (element.eClass().getEStructuralFeature(feature.getName()) == null) {
+                // Feature belongs to a subclass but element was resolved as parent type
+                // (e.g., BrakeCaliper.pistonDiameterInMM on a BrakeComponent).
+                // Treat as guard failure — the element's concrete type differs in this state.
+                throw new IllegalStateException("Feature '" + feature.getName()
+                        + "' is not valid on " + element.eClass().getName()
+                        + " (expected " + feature.getEContainingClass().getName() + ")");
+            }
+            element.eSet(feature, rsa.getNewValue());
 
         } else if (eChange instanceof tools.vitruv.change.atomic.feature.reference.RemoveEReference<HierarchicalId> rr) {
             try {
