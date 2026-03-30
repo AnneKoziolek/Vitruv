@@ -43,7 +43,7 @@ public final class MergeTracer {
     private static final DateTimeFormatter FILE_TS =
             DateTimeFormatter.ofPattern("yyyy-MM-dd_HHmmss");
 
-    private static boolean enabled = true;
+    private static boolean enabled = !Boolean.getBoolean("merge.trace.disabled");
     private static Path outputDir = Path.of("merge-traces");
     private static BufferedWriter fileWriter;
     private static Path currentLogFile;
