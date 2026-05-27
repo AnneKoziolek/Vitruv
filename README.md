@@ -15,6 +15,8 @@ The `VirtualModel` then provides functionality to derive and modify views and to
 
 ## Branching and Semantic Merge
 
+> **Section status: TO BE REVIEWED.** Updated for the MODELS 2026 author rebuttal (2026-05-29); awaiting Anne's review.
+
 The `vsum` module includes experimental support for **Git-integrated branching and semantic three-way merge** of multi-model VSUMs. This extends Vitruvius with:
 
 - **Git hooks** (`post-checkout`, `pre-commit`, `post-commit`) that keep the in-memory VSUM synchronized with the Git working tree.
@@ -26,16 +28,18 @@ The `vsum` module includes experimental support for **Git-integrated branching a
 
 ### Key Classes (in `tools.vitruv.framework.vsum.branch.merge`)
 
-| Class | Purpose |
-|-------|---------|
-| `SemanticMergeEngine` | Core merge algorithm: directed, bidirectional, and interleaving modes |
-| `SemanticMergeCommand` | Entry point taking branch names, resolving SHAs, delegating to engine |
-| `GitMergeDriver` | Git custom merge driver (`main()` class invoked per-file by Git) |
-| `ChangeLogCapture` | `ChangePropagationListener` that records original EChanges per commit |
-| `SemanticChangeLog` | Persists changelog DTOs as JSON in `.vitruvius/semantic-changelogs/` |
-| `UuidConflictDetector` | UUID-based static conflict detection on changelog DTOs |
-| `ChangeDtoDeserializer` | Reconstructs `EChange<HierarchicalId>` from JSON DTOs for replay |
-| `GitStateLoader` | Extracts VSUM state from any Git commit via JGit TreeWalk |
+| Class | Purpose | Notable anchors |
+|-------|---------|-----------------|
+| `SemanticMergeEngine` | Core merge algorithm: directed, bidirectional, and interleaving modes | Replay loop / restart from S₀: lines 352–424. Guard-failure heuristic (runtime edge from most recent other-branch commit): lines 430–440. Enumeration fallback dispatch (`mergeWithInterleavingEnumeration`): line 467. |
+| `CommitDependencyGraph` | Footprint dependency graph between commits; supports `CALCULATED` and `SEQUENTIAL` intra-branch modes | Cyclic-pair detection: `getCyclicPairs()` at line 107. |
+| `InterleavingGenerator` | Exhaustive enumeration of interleavings (used as fallback when the heuristic stalls); gated at `|H_A|+|H_B|≤8` | — |
+| `SemanticMergeCommand` | Entry point taking branch names, resolving SHAs, delegating to engine | — |
+| `GitMergeDriver` | Git custom merge driver (`main()` class invoked per-file by Git) | — |
+| `ChangeLogCapture` | `ChangePropagationListener` that records original EChanges and consequential footprints per commit | `finishedChangePropagation()` is where consequential UUID#feature pairs are captured at commit time. |
+| `SemanticChangeLog` | Persists changelog DTOs as JSON in `.vitruvius/semantic-changelogs/` | — |
+| `UuidConflictDetector` | UUID + feature comparison for direct conflicts on changelog DTOs | — |
+| `ChangeDtoDeserializer` | Reconstructs `EChange<HierarchicalId>` from JSON DTOs for replay | — |
+| `GitStateLoader` | Extracts VSUM state from any Git commit via JGit TreeWalk | — |
 
 ### Git Merge Driver
 
