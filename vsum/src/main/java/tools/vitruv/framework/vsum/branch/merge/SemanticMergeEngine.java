@@ -1329,6 +1329,21 @@ public class SemanticMergeEngine {
         // Commit: ChangeRecordingView captured EMF notifications → propagateChange → reactions fire
         try {
             view.commitChanges();
+        } catch (IllegalArgumentException e) {
+            // A replayed transaction that produces no concrete change is a no-op, not a
+            // failure. This happens for convergent edits, e.g. both branches delete the
+            // same element: the second deletion to be replayed finds the element already
+            // gone, so applyChangeReflectively skips every atomic change and the commit
+            // has nothing to propagate. Vitruvius rejects an empty change with
+            // "This change contains no concrete change" — tolerate it and continue.
+            if (e.getMessage() != null && e.getMessage().contains("no concrete change")) {
+                MergeTracer.trace("[REPLAY] No concrete change to commit (no-op transaction) — skipped");
+                LOGGER.debug("Replay produced no concrete change (no-op transaction): {}", e.getMessage());
+                return;
+            }
+            MergeTracer.trace("[REPLAY] commitChanges failed: " + e.getClass().getSimpleName()
+                    + " — " + e.getMessage());
+            throw e;
         } catch (Exception e) {
             MergeTracer.trace("[REPLAY] commitChanges failed: " + e.getClass().getSimpleName()
                     + " — " + e.getMessage());

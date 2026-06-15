@@ -94,9 +94,15 @@ public class UuidConflictDetector {
             // If same value → both made identical change, no conflict
         }
 
-        // 2. DELETE_MODIFY: ours deleted, theirs modified
+        // 2. DELETE_MODIFY: ours deleted, theirs modified.
+        //    Skip when theirs also deleted the same element: both branches agree
+        //    the element should be gone, so the deletion is convergent (no conflict),
+        //    analogous to both branches setting an attribute to the same value.
+        //    The deletion itself counts as a "modification" in extractModifiedUuids
+        //    (a DeleteEObject is not a CreateEObject), so without this guard a
+        //    delete/delete would be reported as a spurious DELETE_MODIFY.
         for (String deletedUuid : oursDeleted) {
-            if (theirsModifiedUuids.contains(deletedUuid)) {
+            if (theirsModifiedUuids.contains(deletedUuid) && !theirsDeleted.contains(deletedUuid)) {
                 conflicts.add(new MergeConflict(
                         deletedUuid,
                         MergeConflict.ConflictType.DELETE_MODIFY,
@@ -105,9 +111,10 @@ public class UuidConflictDetector {
             }
         }
 
-        // 3. MODIFY_DELETE: theirs deleted, ours modified
+        // 3. MODIFY_DELETE: theirs deleted, ours modified.
+        //    Same convergent-deletion carve-out: skip when ours also deleted it.
         for (String deletedUuid : theirsDeleted) {
-            if (oursModifiedUuids.contains(deletedUuid)) {
+            if (oursModifiedUuids.contains(deletedUuid) && !oursDeleted.contains(deletedUuid)) {
                 conflicts.add(new MergeConflict(
                         deletedUuid,
                         MergeConflict.ConflictType.MODIFY_DELETE,
